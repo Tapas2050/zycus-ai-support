@@ -15,6 +15,13 @@ class FakeLLM:
     def generate_json(self, **kwargs):
         return kwargs["response_model"].model_validate(self.payload)
 
+    def cache_result(self, **kwargs):
+        # No-op for unit tests.
+        #
+        # The real LLMClient persists validated results in its cache,
+        # but these tests only need to verify agent behaviour.
+        pass
+
 
 def test_triage_agent_validates_structured_output():
     ticket = TicketInput(
@@ -34,11 +41,16 @@ def test_triage_agent_validates_structured_output():
             "product_area": "Dashboard",
             "category": "Performance",
             "urgency": "P2",
-            "rationale": "Severe dashboard latency is blocking a time-sensitive business presentation.",
+            "rationale": (
+                "Severe dashboard latency is blocking a time-sensitive "
+                "business presentation."
+            ),
             "known_issue": True,
             "knowledge_base_matches": [kb_match.model_dump()],
             "recommended_responder_team": "Performance Engineering",
-            "first_response": "We can help investigate the dashboard latency.",
+            "first_response": (
+                "We can help investigate the dashboard latency."
+            ),
         }
     )
 
@@ -55,7 +67,10 @@ def test_health_agent_rejects_non_verbatim_ticket_evidence():
 
     repo = DataRepository("data")
     tickets, _ = repo.get_tickets_for_account("ACC-6254")
-    target = next(t for t in tickets if t.ticket_id == "TKT-10196")
+    target = next(
+        t for t in tickets
+        if t.ticket_id == "TKT-10196"
+    )
 
     fake = FakeLLM(
         {
@@ -76,11 +91,15 @@ def test_health_agent_rejects_non_verbatim_ticket_evidence():
                     "ticket_id": target.ticket_id,
                     "risk_type": "escalation",
                     "severity": "High",
-                    "evidence_quote": "This quote is not actually in the ticket.",
+                    "evidence_quote": (
+                        "This quote is not actually in the ticket."
+                    ),
                     "reasoning": "Invalid evidence.",
                 }
             ],
-            "talking_points": ["Review reliability incidents before renewal."],
+            "talking_points": [
+                "Review reliability incidents before renewal."
+            ],
             "ticket_join_strategy": "company_fallback",
         }
     )
@@ -92,4 +111,6 @@ def test_health_agent_rejects_non_verbatim_ticket_evidence():
     except ValueError as exc:
         assert "exact substring" in str(exc)
     else:
-        raise AssertionError("Expected invalid evidence quote to be rejected.")
+        raise AssertionError(
+            "Expected invalid evidence quote to be rejected."
+        )
