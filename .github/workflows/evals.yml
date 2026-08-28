@@ -1,0 +1,65 @@
+name: AI Evaluation
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  test-and-evaluate:
+    runs-on: ubuntu-latest
+
+    env:
+      LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+      LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: pytest -q
+
+      - name: Run AI evaluation harness
+        run: PYTHONPATH=src python -m app.evaluation.runner
+
+      - name: Verify evaluation results
+        run: |
+          python - <<'PY'
+          import json
+          import sys
+          from pathlib import Path
+
+          report_path = Path("eval_report.json")
+
+          if not report_path.exists():
+              print("ERROR: eval_report.json was not generated.")
+              sys.exit(1)
+
+          report = json.loads(
+              report_path.read_text(encoding="utf-8")
+          )
+
+          total = report["total_cases"]
+          passed = report["passed_cases"]
+          quality = report["overall_quality_score"]
+
+          print(f"Evaluation cases : {total}")
+          print(f"Passed cases     : {passed}")
+          print(f"Quality score    : {quality:.1%}")
+
+          if passed != total:
+              print(
+                  f"ERROR: Evaluation failed "
+                  f"({passed}/{total} cases passed)."
+              )
+              sys.exit(1)
+
+          print("AI evaluation passed.")
+          PY
