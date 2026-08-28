@@ -12,6 +12,7 @@ jobs:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+      PYTHONPATH: src
 
     steps:
       - uses: actions/checkout@v4
@@ -27,7 +28,7 @@ jobs:
         run: pytest -q
 
       - name: Run AI evaluation harness
-        run: PYTHONPATH=src python -m app.evaluation.runner
+        run: python -m app.evaluation.runner
 
       - name: Verify evaluation results
         run: |
