@@ -242,7 +242,7 @@ def test_llm_client_retries_null_provider_response():
         def create(self, **kwargs):
             self.calls += 1
             if self.calls == 1:
-                return None
+                return type("Resp", (), {"choices": []})()
             return FakeResponse()
 
     class FakeChat:

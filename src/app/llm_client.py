@@ -273,8 +273,20 @@ class LLMClient:
                     return response
                 except Exception as exc:  # pragma: no cover - exercised via live API
                     last_err = exc
-                    # Handle OpenRouter 402 credit limit by clamping to affordable tokens
                     err_str = str(exc)
+                    if (
+                        isinstance(exc, RuntimeError)
+                        and (
+                            "empty choices list" in err_str
+                            or "null response object" in err_str
+                            or "choice without a message payload" in err_str
+                        )
+                    ):
+                        if attempt >= MAX_TRANSIENT_RETRIES:
+                            raise
+                        time.sleep((attempt + 1) * 1)
+                        continue
+                    # Handle OpenRouter 402 credit limit by clamping to affordable tokens
                     if getattr(exc, "status_code", None) == 402 or "402" in err_str or "fewer max_tokens" in err_str:
                         import re
                         afford_match = re.search(r"can only afford (\d+)", err_str)
@@ -320,12 +332,18 @@ class LLMClient:
                 continue
 
             if not getattr(response, "choices", None):
-                raise RuntimeError("LLM provider returned an empty choices list.")
+                if attempt == 2:
+                    raise RuntimeError("LLM provider returned an empty choices list.")
+                time.sleep(1)
+                continue
 
             choice = response.choices[0]
             message = getattr(choice, "message", None)
             if message is None:
-                raise RuntimeError("LLM provider returned a choice without a message payload.")
+                if attempt == 2:
+                    raise RuntimeError("LLM provider returned a choice without a message payload.")
+                time.sleep(1)
+                continue
 
             content = message.content or ""
             finish_reason = getattr(choice, "finish_reason", None)
