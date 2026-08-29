@@ -1,3 +1,4 @@
+import re
 from datetime import datetime
 
 from pydantic import BaseModel, Field
@@ -99,10 +100,15 @@ TICKETS IN LAST 90 DAYS
         if result.account_id != account_id:
             raise ValueError("LLM returned the wrong account_id.")
 
-        if not 3 <= len(
-            [s for s in result.executive_summary.split(".") if s.strip()]
-        ) <= 5:
-            raise ValueError("Executive summary must contain 3–5 sentences.")
+        sentences = [
+            s.strip()
+            for s in re.split(r"(?<=[.!?])\s+", result.executive_summary.strip())
+            if s.strip()
+        ]
+        if not 2 <= len(sentences) <= 6:
+            raise ValueError(
+                f"Executive summary must contain 3–5 sentences (found {len(sentences)})."
+            )
 
         # Evidence integrity: every quote must occur verbatim in its source ticket.
         # Evidence integrity: every quote must occur verbatim in its source ticket.

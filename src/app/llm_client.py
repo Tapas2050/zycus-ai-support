@@ -234,102 +234,110 @@ class LLMClient:
         # room, and retry once with a larger budget if truncation
         # still happens (e.g. on data-heavy accounts).
 
-        REASONING_TOKEN_CAP = 2000
+        REASONING_TOKEN_CAP = 800
         BASE_MAX_TOKENS = 8192
-        RETRY_MAX_TOKENS = 16384
+        RETRY_MAX_TOKENS = 11000
         MAX_TRANSIENT_RETRIES = 3
 
-        def _call(max_tokens: int):
-            return self.client.chat.completions.create(
-                model=self.model,
-                messages=[
-                    {
-                        "role": "system",
-                        "content": system_prompt,
-                    },
-                    {
-                        "role": "user",
-                        "content": user_prompt,
-                    },
-                ],
-                temperature=temperature,
-                max_tokens=max_tokens,
-                extra_body={
-                    "reasoning": {
-                        "max_tokens": REASONING_TOKEN_CAP,
-                    },
-                },
-                response_format={
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_model.__name__,
-                        "schema": schema,
-                    },
-                },
-            )
+        def _call_provider(max_tokens: int, extra_body: dict | None = None):
+            last_err = None
+            current_max_tokens = max_tokens
+            for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+                try:
+                    kwargs = {
+                        "model": self.model,
+                        "messages": [
+                            {
+                                "role": "system",
+                                "content": system_prompt,
+                            },
+                            {
+                                "role": "user",
+                                "content": user_prompt,
+                            },
+                        ],
+                        "temperature": temperature,
+                        "max_tokens": current_max_tokens,
+                        "response_format": {
+                            "type": "json_schema",
+                            "json_schema": {
+                                "name": response_model.__name__,
+                                "schema": schema,
+                            },
+                        },
+                    }
+                    if extra_body:
+                        kwargs["extra_body"] = extra_body
 
-        response = None
-        last_error = None
-        for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+                    return self.client.chat.completions.create(**kwargs)
+                except Exception as exc:  # pragma: no cover - exercised via live API
+                    last_err = exc
+                    # Handle OpenRouter 402 credit limit asking for fewer max_tokens
+                    if getattr(exc, "status_code", None) == 402 and "fewer max_tokens" in str(exc):
+                        current_max_tokens = min(current_max_tokens, 6000)
+                        time.sleep(1)
+                        continue
+                    if not self._is_retryable_error(exc) or attempt >= MAX_TRANSIENT_RETRIES:
+                        raise
+                    time.sleep((attempt + 1) * 1)
+            raise last_err
+
+        # ---------------------------------------------------------
+        # 4. EXECUTE MODEL CALL (WITH ROBUST RETRY LOOP)
+        # ---------------------------------------------------------
+
+        last_content = ""
+        last_finish_reason = None
+        last_validation_exc = None
+
+        for attempt in range(3):
+            max_tokens = BASE_MAX_TOKENS if attempt == 0 else RETRY_MAX_TOKENS
+            # Attempt 0 & 1 use reasoning cap; Attempt 2 drops extra_body in case the provider has issues with it
+            extra_body = {"reasoning": {"max_tokens": REASONING_TOKEN_CAP}} if attempt < 2 else None
+
             try:
-                response = _call(BASE_MAX_TOKENS)
-                break
-            except Exception as exc:  # pragma: no cover - exercised via live API
-                last_error = exc
-                if not self._is_retryable_error(exc) or attempt >= MAX_TRANSIENT_RETRIES:
+                response = _call_provider(max_tokens, extra_body)
+            except Exception as exc:
+                if attempt == 2:
                     raise
-                sleep_for = (attempt + 1) * 1
-                time.sleep(sleep_for)
+                time.sleep(1)
+                continue
 
-        if response is None:
-            raise last_error
-
-        message = response.choices[0].message
-        content = message.content
-        finish_reason = response.choices[0].finish_reason
-
-        if not content and finish_reason == "length":
-            # Truncated even with the reasoning cap — retry once
-            # with a larger total budget before giving up.
-            response = _call(RETRY_MAX_TOKENS)
             message = response.choices[0].message
-            content = message.content
+            content = message.content or ""
             finish_reason = response.choices[0].finish_reason
+            last_content = content
+            last_finish_reason = finish_reason
+
+            if not content:
+                time.sleep(1)
+                continue
+
+            try:
+                result = response_model.model_validate_json(content)
+                return result
+            except Exception as exc:
+                last_validation_exc = exc
+                time.sleep(1)
+                continue
 
         # ---------------------------------------------------------
-        # 4. EXTRACT MODEL OUTPUT
+        # 5. DIAGNOSTICS IF ALL ATTEMPTS FAILED
         # ---------------------------------------------------------
 
-        if not content:
+        if not last_content:
             print("\n===== EMPTY LLM RESPONSE DEBUG =====")
             print(f"Model: {self.model}")
-            print(f"Finish reason: {finish_reason}")
-            print(f"Message: {message}")
-            print(f"Full response: {response}")
+            print(f"Finish reason: {last_finish_reason}")
             print("====================================\n")
-            if finish_reason == "length":
-                raise RuntimeError(
-                    "LLM response was truncated before structured output "
-                    "was produced, even after retrying with a larger "
-                    f"token budget ({RETRY_MAX_TOKENS}). Reduce prompt "
-                    "size or increase RETRY_MAX_TOKENS further."
-                )
-            raise RuntimeError(
-                "LLM returned an empty response."
-            )
+            raise RuntimeError("LLM returned an empty response.")
 
-        # ---------------------------------------------------------
-        # 5. VALIDATE WITH PYDANTIC
-        # ---------------------------------------------------------
-
-        try:
-            result = response_model.model_validate_json(
-                content
-            )
-        except Exception as exc:
-            raise RuntimeError(
-                "LLM returned invalid structured output."
-            ) from exc
+        print("\n===== INVALID JSON DEBUG =====")
+        print(f"Model: {self.model}")
+        print(f"Finish reason: {last_finish_reason}")
+        print(f"Content: {repr(last_content)}")
+        print("==============================\n")
+        raise RuntimeError("LLM returned invalid structured output.") from last_validation_exc
 
         # ---------------------------------------------------------
         # 6. CACHE ONLY SUCCESSFUL VALIDATED RESULTS
