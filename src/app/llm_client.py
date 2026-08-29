@@ -79,7 +79,8 @@ def _normalize_json_schema(schema: dict) -> dict:
                         walk(prop)
 
         if node.get("type") == "object" or "properties" in node:
-            node["required"] = list(dict.fromkeys(required))
+            all_props = list(node.get("properties", {}).keys())
+            node["required"] = list(dict.fromkeys(required + all_props))
         elif "required" in node:
             del node["required"]
 
@@ -237,12 +238,12 @@ class LLMClient:
         # room, and retry once with a larger budget if truncation
         # still happens (e.g. on data-heavy accounts).
 
-        REASONING_TOKEN_CAP = 800
-        BASE_MAX_TOKENS = 8192
-        RETRY_MAX_TOKENS = 11000
+        REASONING_TOKEN_CAP = 150
+        BASE_MAX_TOKENS = 2500
+        RETRY_MAX_TOKENS = 3000
         MAX_TRANSIENT_RETRIES = 3
 
-        def _call_provider(max_tokens: int, response_format: dict, extra_body: dict | None = None):
+        def _call_provider(max_tokens: int, response_format: dict):
             last_err = None
             current_max_tokens = max_tokens
             for attempt in range(MAX_TRANSIENT_RETRIES + 1):
@@ -262,16 +263,20 @@ class LLMClient:
                         "temperature": temperature,
                         "max_tokens": current_max_tokens,
                         "response_format": response_format,
+                        "extra_body": {"reasoning": {"max_tokens": REASONING_TOKEN_CAP}},
                     }
-                    if extra_body:
-                        kwargs["extra_body"] = extra_body
-
                     return self.client.chat.completions.create(**kwargs)
                 except Exception as exc:  # pragma: no cover - exercised via live API
                     last_err = exc
-                    # Handle OpenRouter 402 credit limit asking for fewer max_tokens
-                    if getattr(exc, "status_code", None) == 402 and "fewer max_tokens" in str(exc):
-                        current_max_tokens = min(current_max_tokens, 6000)
+                    # Handle OpenRouter 402 credit limit by clamping to affordable tokens
+                    err_str = str(exc)
+                    if getattr(exc, "status_code", None) == 402 or "402" in err_str or "fewer max_tokens" in err_str:
+                        import re
+                        afford_match = re.search(r"can only afford (\d+)", err_str)
+                        if afford_match:
+                            current_max_tokens = max(500, int(afford_match.group(1)) - 50)
+                        else:
+                            current_max_tokens = min(current_max_tokens, 1500)
                         time.sleep(1)
                         continue
                     if not self._is_retryable_error(exc) or attempt >= MAX_TRANSIENT_RETRIES:
@@ -298,13 +303,11 @@ class LLMClient:
                         "schema": schema,
                     },
                 }
-                extra_body = {"reasoning": {"max_tokens": REASONING_TOKEN_CAP}}
             else:
                 resp_fmt = {"type": "json_object"}
-                extra_body = None
 
             try:
-                response = _call_provider(max_tokens, resp_fmt, extra_body)
+                response = _call_provider(max_tokens, resp_fmt)
             except Exception as exc:
                 if attempt == 2:
                     raise
@@ -331,8 +334,24 @@ class LLMClient:
                 time.sleep(1)
                 continue
 
+            # Strip markdown code blocks or surrounding prose if present
+            clean_content = content.strip()
+            if clean_content.startswith("```json"):
+                clean_content = clean_content[7:]
+            elif clean_content.startswith("```"):
+                clean_content = clean_content[3:]
+            if clean_content.endswith("```"):
+                clean_content = clean_content[:-3]
+            clean_content = clean_content.strip()
+            if not (clean_content.startswith("{") and clean_content.endswith("}")):
+                import re
+                match = re.search(r"(\{.*\})", clean_content, re.DOTALL)
+                if match:
+                    clean_content = match.group(1).strip()
+
             try:
-                result = response_model.model_validate_json(content)
+                result = response_model.model_validate_json(clean_content)
+                cache_path.write_text(clean_content, encoding="utf-8")
                 return result
             except Exception as exc:
                 last_validation_exc = exc

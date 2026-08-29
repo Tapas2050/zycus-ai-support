@@ -28,14 +28,14 @@ class KBMatch(BaseModel):
 class TriageResult(BaseModel):
     prompt_version: str = TRIAGE_PROMPT_VERSION
     product: str | None = None
-    product_area: str
-    category: str
-    urgency: str
-    rationale: str
-    known_issue: bool
+    product_area: str = "General"
+    category: str = "Product / Feature Inquiry"
+    urgency: str = "P3"
+    rationale: str = ""
+    known_issue: bool = False
     knowledge_base_matches: list[KBMatch] = Field(default_factory=list)
-    recommended_responder_team: str
-    first_response: str
+    recommended_responder_team: str = "Product Support"
+    first_response: str = ""
 
 
 class TriageAgent:
@@ -148,10 +148,24 @@ class TriageAgent:
 
         # Responder team must belong to the controlled vocabulary.
         if result.recommended_responder_team not in RESPONDER_TEAMS:
-            raise ValueError(
-                "Invalid responder team: "
-                f"{result.recommended_responder_team}"
-            )
+            cat_map = {
+                "Performance": "Performance Engineering",
+                "Billing / Invoicing": "Billing Support",
+                "Onboarding / Setup": "Onboarding Support",
+                "Security / Access / Authentication": "Security & Identity Support",
+                "Integration / API": "Integration Support",
+                "Data / Pipeline / Sync Issue": "Data Reliability / Incident Response",
+                "Product / Feature Inquiry": "Product Support",
+                "Bug / Unexpected Behavior": "Technical Support",
+            }
+            mapped = cat_map.get(result.category)
+            if mapped:
+                result.recommended_responder_team = mapped
+            else:
+                raise ValueError(
+                    "Invalid responder team: "
+                    f"{result.recommended_responder_team}"
+                )
 
         # =========================================================
         # 6. KB CITATION INTEGRITY
