@@ -6,6 +6,10 @@ sys.path.insert(
     str(Path(__file__).resolve().parent / "src"),
 )
 import json
+import queue as _queue
+import random
+import threading
+import time
 
 import gradio as gr
 from fastapi.testclient import TestClient
@@ -60,8 +64,80 @@ EXAMPLE_TICKETS = [
     ],
 ]
 
+# -----------------------------------------------------------------------
+# Wait messages — shown when the AI call is running long / retrying
+# -----------------------------------------------------------------------
+
+WAIT_MESSAGES: list[tuple[str, str]] = [
+    ("☕", "Grab a coffee — the AI is being extra thorough on this one…"),
+    ("🧠", "Deep analysis in progress — almost there…"),
+    ("🔍", "Cross-referencing the knowledge base for the best match…"),
+    ("🔄", "The model may be retrying a slow provider call — we've got this!"),
+    ("💡", "Complex tickets sometimes need a bit more time — hang tight…"),
+    ("🌐", "Waiting on the AI provider — network latency can add a few seconds…"),
+    ("⏳", "This is taking a little longer than usual — thanks for your patience!"),
+    ("🚀", "Refining the response — almost ready to show you the result…"),
+    ("🎯", "Cross-checking triage rules to make sure you get the right routing…"),
+    ("🔧", "Running guardrails and KB citation checks — just a moment more…"),
+]
+
+FUN_FACTS: list[tuple[str, str]] = [
+    ("🤔", "**Fun fact:** AI-assisted triage can cut first-response time by up to **60%**."),
+    ("📊", "**Did you know?** The average enterprise support desk handles over **1,000 tickets per month**."),
+    ("🏆", "**Fun fact:** Tickets triaged within the first hour score **40% higher** on customer satisfaction."),
+    ("💬", "**Did you know?** The word *triage* comes from French field medicine — sorting casualties by urgency since the Napoleonic Wars."),
+    ("🤖", "**Fun fact:** RAG (Retrieval-Augmented Generation) pairs a search engine with an LLM to give grounded, factual answers instead of hallucinations."),
+    ("📈", "**Did you know?** P1 tickets escalated within **15 minutes** resolve **3× faster** on average."),
+    ("🧩", "**Fun fact:** The knowledge base here is indexed with **TF-IDF** — a technique from the 1970s still going strong in modern AI pipelines."),
+    ("🔬", "**Did you know?** LLMs are significantly more accurate when given explicit context — that's exactly what the KB retrieval step does here."),
+    ("⚡", "**Fun fact:** OpenRouter routes your request to the best available model endpoint in real time, across dozens of providers."),
+    ("🎯", "**Did you know?** Correctly routing a ticket on first contact saves an average of **2.5 hours** of handling time."),
+    ("🌍", "**Fun fact:** The global enterprise support software market is worth over **$12 billion** and still growing."),
+    ("🔐", "**Did you know?** Authentication failures (SSO, OAuth) top the global P1 escalation charts year after year."),
+]
+
+
+def _status_md(icon: str, body: str, *, elapsed: int | None = None) -> str:
+    """Render a friendly waiting-state card in Markdown."""
+    timing = (
+        f"\n\n<sub>⏱️ {elapsed}s elapsed — still running, please wait…</sub>"
+        if elapsed is not None
+        else ""
+    )
+    return f"### {icon} Working on it…\n\n{body}{timing}"
+
+
+def _next_wait_card(shown_fact_ids: set[int]) -> tuple[str, str, set[int]]:
+    """Return *(icon, markdown_card, updated_shown_fact_ids)*.
+
+    Cycles through FUN_FACTS without repeating until all have been shown,
+    and pairs each fact with a randomly chosen WAIT_MESSAGES blurb.
+    """
+    remaining = [i for i in range(len(FUN_FACTS)) if i not in shown_fact_ids]
+    if not remaining:
+        shown_fact_ids = set()
+        remaining = list(range(len(FUN_FACTS)))
+
+    fact_idx = random.choice(remaining)
+    shown_fact_ids = shown_fact_ids | {fact_idx}
+
+    fact_icon, fact_text = FUN_FACTS[fact_idx]
+    wait_icon, wait_text = random.choice(WAIT_MESSAGES)
+
+    card = (
+        f"> {wait_icon} _{wait_text}_\n\n"
+        f"---\n\n"
+        f"{fact_icon} {fact_text}"
+    )
+    return wait_icon, card, shown_fact_ids
+
+
+# -----------------------------------------------------------------------
+# Static reference data / lookups
+# -----------------------------------------------------------------------
 
 def _account_choices() -> list[tuple[str, str]]:
+
     """Build (label, value) choices for the account dropdown via the API."""
     try:
         resp = client.get("/accounts")
@@ -151,23 +227,60 @@ def _format_health_markdown(result) -> str:
 # -----------------------------------------------------------------------
 
 def triage_ticket(subject: str, body: str):
+    """Stream live status cards while the triage pipeline runs.
+
+    Gradio detects that this is a generator and will update the output
+    panel after each yield, giving the user real-time feedback during
+    LLM retries, slow provider calls, and KB retrieval.
+    """
     if not subject.strip():
         raise gr.Error("Please enter a ticket subject.")
     if not body.strip():
         raise gr.Error("Please enter the ticket body.")
 
-    try:
-        ticket = TicketInput(subject=subject, body=body)
-        resp = client.post("/triage", json=ticket.model_dump())
-        if resp.status_code != 200:
-            raise RuntimeError(resp.json().get("detail", resp.text))
-        result = TriageResult.model_validate(resp.json())
-    except Exception as exc:
-        raise gr.Error(f"Triage failed: {exc}") from exc
+    result_q: _queue.Queue = _queue.Queue()
 
-    markdown = _format_triage_markdown(result)
-    raw_json = json.dumps(result.model_dump(), indent=2, ensure_ascii=False)
-    return markdown, raw_json
+    def _run() -> None:
+        try:
+            ticket = TicketInput(subject=subject, body=body)
+            resp = client.post("/triage", json=ticket.model_dump())
+            if resp.status_code != 200:
+                raise RuntimeError(resp.json().get("detail", resp.text))
+            result = TriageResult.model_validate(resp.json())
+            result_q.put(("ok", result))
+        except Exception as exc:
+            result_q.put(("error", exc))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    # ── Initial status card ───────────────────────────────────────────
+    yield _status_md("⏳", "Sending your ticket through the triage pipeline…"), ""
+
+    start = time.monotonic()
+    last_card_at = start
+    shown_fact_ids: set[int] = set()
+
+    # ── Poll until the background thread finishes ─────────────────────
+    while True:
+        try:
+            kind, value = result_q.get(timeout=0.5)
+        except _queue.Empty:
+            now = time.monotonic()
+            if now - last_card_at >= 15:
+                elapsed = int(now - start)
+                icon, card, shown_fact_ids = _next_wait_card(shown_fact_ids)
+                yield _status_md(icon, card, elapsed=elapsed), ""
+                last_card_at = now
+            continue
+
+        # ── Done ─────────────────────────────────────────────────────
+        if kind == "ok":
+            markdown = _format_triage_markdown(value)
+            raw_json = json.dumps(value.model_dump(), indent=2, ensure_ascii=False)
+            yield markdown, raw_json
+            return
+        else:
+            raise gr.Error(f"Triage failed: {value}")
 
 
 def clear_triage():
@@ -198,25 +311,67 @@ def _format_ticket_history_markdown(account_id: str) -> str:
 
 
 def get_account_health(account_id: str):
+    """Stream live status cards while the account health analysis runs.
+
+    Account health is the slower of the two operations — it processes the
+    full ticket history through the LLM, which can trigger the token-budget
+    retry path. The generator keeps the user informed with status cards and
+    fun facts every 15 seconds instead of an unresponsive blank panel.
+    """
     if not account_id or not account_id.strip():
         raise gr.Error("Please choose an account.")
 
-    try:
-        resp = client.get(f"/accounts/{account_id.strip()}/health")
-        if resp.status_code == 404:
-            raise ValueError(resp.json().get("detail", "not found"))
-        if resp.status_code != 200:
-            raise RuntimeError(resp.json().get("detail", resp.text))
-        result = AccountHealthResult.model_validate(resp.json())
-    except ValueError as exc:
-        raise gr.Error(f"Account not found: {exc}") from exc
-    except Exception as exc:
-        raise gr.Error(f"Account health analysis failed: {exc}") from exc
+    result_q: _queue.Queue = _queue.Queue()
 
-    markdown = _format_health_markdown(result)
-    raw_json = json.dumps(result.model_dump(), indent=2, ensure_ascii=False)
-    history = _format_ticket_history_markdown(account_id)
-    return markdown, raw_json, history
+    def _run() -> None:
+        try:
+            resp = client.get(f"/accounts/{account_id.strip()}/health")
+            if resp.status_code == 404:
+                raise ValueError(resp.json().get("detail", "not found"))
+            if resp.status_code != 200:
+                raise RuntimeError(resp.json().get("detail", resp.text))
+            result = AccountHealthResult.model_validate(resp.json())
+            history = _format_ticket_history_markdown(account_id)
+            result_q.put(("ok", result, history))
+        except ValueError as exc:
+            result_q.put(("not_found", exc))
+        except Exception as exc:
+            result_q.put(("error", exc))
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    # ── Initial status card ───────────────────────────────────────────
+    yield _status_md("📊", "Fetching account data and analysing health signals…"), "", ""
+
+    start = time.monotonic()
+    last_card_at = start
+    shown_fact_ids: set[int] = set()
+
+    # ── Poll until the background thread finishes ─────────────────────
+    while True:
+        try:
+            payload = result_q.get(timeout=0.5)
+        except _queue.Empty:
+            now = time.monotonic()
+            if now - last_card_at >= 15:
+                elapsed = int(now - start)
+                icon, card, shown_fact_ids = _next_wait_card(shown_fact_ids)
+                yield _status_md(icon, card, elapsed=elapsed), "", ""
+                last_card_at = now
+            continue
+
+        # ── Done ─────────────────────────────────────────────────────
+        kind = payload[0]
+        if kind == "ok":
+            _, result, history = payload
+            markdown = _format_health_markdown(result)
+            raw_json = json.dumps(result.model_dump(), indent=2, ensure_ascii=False)
+            yield markdown, raw_json, history
+            return
+        elif kind == "not_found":
+            raise gr.Error(f"Account not found: {payload[1]}")
+        else:
+            raise gr.Error(f"Account health analysis failed: {payload[1]}")
 
 
 def clear_health():
@@ -243,6 +398,33 @@ button.primary:hover {opacity: 0.88;}
 input, textarea, select {border-radius: var(--zy-radius) !important;}
 .tab-nav button {font-weight: 600;}
 footer {visibility: hidden}
+
+/* ── Streaming status card ─────────────────────────────────────────── */
+@keyframes zy-pulse {0%,100%{opacity:1}50%{opacity:.55}}
+@keyframes zy-border-shimmer {
+    0%   {border-color: #93c5fd;}
+    50%  {border-color: #2563EB;}
+    100% {border-color: #93c5fd;}
+}
+/* Pulse the "Working on it…" h3 that appears only in status cards */
+.result_panel .prose h3:has(+ p) {
+    animation: zy-pulse 2s ease-in-out infinite;
+    color: var(--zy-accent);
+}
+/* Shimmer the panel border while streaming */
+.result_panel:has(h3) {
+    animation: zy-border-shimmer 2s ease-in-out infinite;
+}
+/* Style the blockquote wait-blurb inside the status card */
+.result_panel blockquote {
+    border-left: 3px solid var(--zy-accent);
+    background: color-mix(in srgb, var(--zy-accent) 6%, transparent);
+    border-radius: 0 var(--zy-radius) var(--zy-radius) 0;
+    padding: 0.5rem 0.85rem;
+    margin: 0.5rem 0;
+    font-style: normal;
+    color: var(--body-text-color);
+}
 """
 
 THEME = gr.themes.Soft(

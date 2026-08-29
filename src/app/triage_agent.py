@@ -313,6 +313,45 @@ class TriageAgent:
                 "KB matches."
             )
 
+        if result.known_issue and result.knowledge_base_matches:
+            ticket_text = f"{ticket.subject} {ticket.body}".lower()
+            operation_terms = {
+                "dashboard",
+                "exports",
+                "export",
+                "data sources",
+                "login",
+                "sso",
+                "sync",
+                "api",
+                "report",
+                "query",
+            }
+            specific_ticket_ops = {
+                term for term in operation_terms if term in ticket_text
+            }
+
+            if specific_ticket_ops:
+                mismatched = False
+                for match in result.knowledge_base_matches:
+                    kb_heading = (match.heading or "").lower()
+                    kb_source = match.source_file.lower()
+                    if any(
+                        term in kb_heading or term in kb_source
+                        for term in specific_ticket_ops
+                    ):
+                        continue
+                    mismatched = True
+                    break
+
+                if mismatched:
+                    result = result.model_copy(
+                        update={
+                            "known_issue": False,
+                            "knowledge_base_matches": [],
+                        }
+                    )
+
         # =========================================================
         # 8. CACHE ONLY AFTER ALL GUARDRAILS PASS
         # =========================================================

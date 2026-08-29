@@ -4,105 +4,178 @@
 
 ## 🎯 Problem
 
-Support and TAM teams need fast, consistent classification of incoming tickets and a trustworthy read on account health — without an LLM hallucinating a KB citation, inventing a churn signal, or joining the wrong customer's ticket history.
+The repo implements a local internal tool for two concrete tasks:
 
-**Goal:** turn a raw ticket into a validated triage decision, and a raw account into an evidence-backed health summary, with every claim traceable back to real data.
+1. **Ticket triage** from a support subject/body (category, urgency, product area, responder team routing, suggested first response, and cited KB articles).
+2. **TAM-style account health analysis** for a known account ID (executive summary, account-level risk signals, verbatim-cited ticket risks, talking points for next calls, and ticket join strategy tracking).
+
+The crucial design constraint is **strict validation**: the app rejects invalid categories, invalid responder teams, ungrounded KB citations, wrong account IDs, and ticket-risk evidence that is not an exact substring of the source ticket body. In other words, the app is designed to keep the model honest by checking the generated response against dataset facts, KB retrieval results, and schema contracts before accepting or caching it.
+
+---
 
 ## 🛠️ Technologies Used
 
 | Category | Tools |
 |---|---|
-| Language | Python 3.11+ |
-| Backend API | FastAPI, Uvicorn, Pydantic v2 |
-| UI | Gradio (Blocks, custom theme/CSS) |
-| LLM / Structured Output | OpenAI SDK → OpenRouter, JSON-schema-constrained generation, content-addressed on-disk caching |
-| Retrieval | scikit-learn (`TfidfVectorizer` + cosine similarity) over local Markdown knowledge base |
-| Testing | pytest |
-| CI/CD | GitHub Actions (`.github/workflows/evals.yml`) |
+| **Language** | Python 3.11+ |
+| **Backend API** | FastAPI, Uvicorn, Pydantic v2 |
+| **UI & UX** | Gradio 6.x (Blocks, background streaming generator workers, queue polling, custom CSS keyframe animations) |
+| **LLM / Structured Output** | OpenAI SDK → OpenRouter (`z-ai/glm-5.3-flash`), JSON-schema-constrained generation, reasoning-token budget management, content-addressed on-disk caching |
+| **Retrieval** | scikit-learn (`TfidfVectorizer` + cosine similarity) over local Markdown knowledge base |
+| **Testing** | pytest, `pytest.ini`, unittest.mock |
+| **CI/CD** | GitHub Actions (`.github/workflows/evals.yml`) with automated evaluation gates |
 
-## 🔄 Project Workflow
+---
+
+## 🔄 Actual Code Flow
+
+This is the execution path in the repo:
 
 ```text
-                     Synthetic Dataset
-             ┌───────────┬──────────────┐
-             │           │              │
-          Tickets     Accounts        KB (Markdown)
-             │           │              │
-             └──────┬────┴──────┬───────┘
-                    │           │
-              DataRepository  KBRetriever
-              (ID→company      (TF-IDF +
-               join fallback)   cosine sim)
-                    │           │
-          ┌─────────┴───────────┴─────────┐
-          │                               │
-      TriageAgent                    HealthAgent
-   (category/urgency/            (risk signals +
-    routing + KB match)           quoted evidence)
-          │                               │
-          └──────────────┬────────────────┘
-                         │
-                 Pydantic validation
-                         │
-              FastAPI app (/triage, /accounts,
-              /accounts/{id}/health, /accounts/{id}/tickets)
-                         │
-        Gradio UI (ui.py) — same process, calls the
-        FastAPI app via TestClient (in-memory, no
-        network hop, no separate uvicorn needed)
-                         │
-                 Evaluation Harness (CI-gated)
+data/accounts.json + data/tickets.json
+        │
+        ├── DataRepository
+        │      - loads accounts and tickets
+        │      - resolves account lookup by account_id
+        │      - applies company-based fallback for ticket/account matching
+        │      - exposes get_tickets_for_account(account_id, days=90)
+        │
+        ├── KBRetriever
+        │      - loads knowledge-base markdown files
+        │      - vectorizes with TF-IDF
+        │      - retrieves top chunks for a ticket query
+        │      - formats retrieved context for LLM use
+        │
+        ├── TriageAgent
+        │      - calls KBRetriever.retrieve(...)
+        │      - builds user prompt with only retrieved KB sources
+        │      - calls LLMClient.generate_json(..., response_model=TriageResult)
+        │      - enforces category / urgency / responder-team constraints
+        │      - validates KB source_file + heading against retrieved chunks
+        │      - defends against false-positive generic KB citations
+        │      - caches result only after all guardrails pass
+        │
+        ├── HealthAgent
+        │      - resolves account via DataRepository.get_account(account_id)
+        │      - calls repo.get_tickets_for_account(account_id, days=90)
+        │      - builds account + recent-ticket prompt
+        │      - calls LLMClient.generate_json(..., response_model=AccountHealthResult)
+        │      - enforces account_id match and verbatim evidence-substring checks
+        │      - caches result only after all guardrails pass
+        │
+        ├── FastAPI app in src/app/api.py
+        │      - /health
+        │      - /triage
+        │      - /accounts
+        │      - /accounts/{account_id}/health
+        │      - /accounts/{account_id}/tickets
+        │
+        ├── Gradio UI in ui.py (Real-time Streaming Engine)
+        │      - builds a TestClient around the FastAPI app
+        │      - executes agent calls asynchronously in daemon worker threads
+        │      - streams live status cards, elapsed time, and retry/patience notices
+        │      - cycles non-repeating fun facts & industry insights every 15s
+        │      - renders validated markdown + formatted raw JSON results
+        │
+        └── Evaluation harness
+               - tests/ unit tests (12 test cases)
+               - src/app/evaluation/runner.py
+               - writes eval_report.json (100% quality score)
 ```
 
-## ✨ Features / Highlights
+---
 
-- 🧠 **Retrieval-grounded triage** — the LLM only sees KB chunks actually retrieved by TF-IDF/cosine similarity, and KB citations that weren't retrieved are rejected, so it can't invent a source.
-- 🔗 **Data-quality-aware account join** — `DataRepository` joins tickets to accounts by `account_id` first, validates against ticket `company`, and falls back to a company-name join when the ID is inconsistent — the strategy used (`account_id` vs `company_fallback`) is returned in the output, not hidden.
-- 📎 **Verbatim evidence enforcement** — every ticket-level risk flag must include an exact substring quote from the source ticket body; non-verbatim evidence is rejected before it reaches the response.
-- 💾 **Content-addressed LLM caching** — results are cached by a hash of model + system prompt + user prompt + response schema, so identical evaluation cases return identical results without re-calling the LLM.
-- 🛡️ **Reasoning-budget-safe structured output** — the LLM client caps the reasoning-token budget separately from the output budget and retries once with a larger total budget on truncation, so reasoning-heavy models don't silently return an empty response.
-- 🖥️ **Gradio UI with real account lookup** — the Account Health tab uses a searchable dropdown built from the actual dataset (not free-text ID guessing), and both tabs render results as formatted Markdown with the raw JSON available in a collapsible panel.
-- 🔌 **UI drives the real API, in-process** — `ui.py` never imports and calls the agents directly. It wraps the FastAPI `app` in a `TestClient` and every UI action is a real HTTP call through routing/validation/error-handling, with no separate server process required.
-- 🧪 **CI-gated evaluation** — GitHub Actions runs unit tests and the evaluation harness on every push and fails the build if any case regresses.
+## ✨ Features Implemented in This Repo
+
+- 🧠 **KB-grounded triage** — `TriageAgent` retrieves chunks from the markdown knowledge base before invoking the LLM, and it validates that every cited KB match came from the retrieved set. The code rejects unsupported citations rather than letting the model invent a source.
+- 🔄 **Real-time UI streaming & wait engagement** — `ui.py` runs LLM pipelines in background threads while streaming live status cards to the Gradio interface:
+  - Immediate initial acknowledgement so users never experience a frozen UI.
+  - Multi-phase wait blurbs informing users during retries, provider latency, or deep reasoning calls (e.g. *"Grab a coffee — the AI is being extra thorough…"*, *"The model may be retrying a slow provider call…"*, *"Running guardrails and KB citation checks…"*, etc.).
+  - 15-second heartbeat intervals that display elapsed time alongside non-repeating fun facts about AI, support engineering, and triage history.
+  - Custom pulsing and shimmering CSS animations for the status panel during active processing.
+- 🔗 **Data-quality-aware ticket/account matching** — `DataRepository` resolves account/ticket relations using the real dataset, and the repo’s health flow records the selected strategy (`account_id` vs fallback behavior) through the response contract rather than silently hiding it.
+- 📎 **Evidence-verification for ticket risks** — `HealthAgent` requires every `evidence_quote` to be an exact substring of the source ticket body. This is enforced in code before the response is accepted.
+- 💾 **Guardrail-gated on-disk caching** — `LLMClient` creates a SHA-256 content-addressed hash from model + prompt + schema and stores output under `.cache/llm/`. Caching is intentionally deferred until *after* all semantic guardrails pass, preventing bad or unvalidated responses from being permanently saved.
+- 🛡️ **Transient retry & token budget resilience** — `LLMClient.generate_json()` retries on provider/network failures (`APITimeoutError`, `APIConnectionError`, `RateLimitError`, and 5xx/429 status codes). It also detects reasoning-token budget exhaustion (`finish_reason="length"`) and retries with an expanded token budget.
+- 🔒 **Structured-output schema normalization** — `_normalize_json_schema()` explicitly adjusts nested array-item requirements to resolve Pydantic default-factory behaviors and ensure array fields (like `knowledge_base_matches` and `ticket_risks`) are treated as required by strict LLMs.
+- 🚫 **Module/operation guardrails** — `TriageAgent` checks the relationship between a retrieved KB chunk and the ticket’s operating context so a generic KB hit cannot be treated as a valid answer for a different product area or operation.
+- 🖥️ **UI uses the real API path** — `ui.py` instantiates `TestClient(fastapi_app)` from `src/app/api.py`; the UI is not calling repository classes directly. Each Gradio action hits the FastAPI endpoints with validation/error handling intact.
+- 🧪 **Code-driven evaluation suite** — Includes 12 unit tests and a dedicated evaluation harness in `src/app/evaluation/runner.py` testing standard and adversarial scenarios, writing `eval_report.json`.
+
+---
 
 ## 📈 Evaluation Results
 
-From the current `eval_report.json`:
+From `eval_report.json`:
 
 | Metric | Value |
 |---|---|
 | Total cases | 5 (3 triage, 2 account-health) |
 | Passed | 5 / 5 |
-| Overall quality score | 1.0 |
+| Overall quality score | 100.0% (1.0) |
 | Adversarial coverage | ✅ (e.g. `healthy_account_with_customer_declared_p1` — account metadata says "Healthy" while a ticket body declares a P1) |
+| Test suite status | ✅ 12 passed in `pytest` |
 
-## 📁 Project Structure
+---
+
+## 📁 Actual Repo Structure
 
 ```text
 zycus-ai-support/
-├── run.py                        # FastAPI entry point
-├── ui.py                         # Gradio UI entry point
-├── health_check.py               # standalone health-check script
-├── src/app/
-│   ├── api.py                    # FastAPI routes (/triage, /accounts, /accounts/{id}/health, /accounts/{id}/tickets)
-│   ├── config.py                 # env-driven settings (.env via python-dotenv)
-│   ├── models.py                 # Pydantic models: Ticket, Account, TicketInput, KBChunk
-│   ├── data_repository.py        # ticket/account loading + ID→company join fallback
-│   ├── kb_retriever.py           # TF-IDF + cosine-similarity KB retrieval
-│   ├── llm_client.py             # OpenRouter client, JSON-schema output, caching, retry
-│   ├── triage_agent.py           # ticket → category/urgency/routing/KB matches
-│   ├── health_agent.py           # account → risk signals + evidence-quoted ticket risks
-│   ├── prompts.py                # versioned system prompts (TRIAGE/HEALTH_PROMPT_VERSION)
-│   └── evaluation/
-│       ├── cases.py               # evaluation case definitions (incl. adversarial cases)
-│       ├── runner.py              # runs cases → eval_report.json
-│       └── scorer.py              # scoring logic
-├── data/                         # accounts.json, tickets.json (synthetic)
-├── knowledge-base/               # Markdown KB: billing, onboarding, products, troubleshooting
-├── tests/                        # pytest unit tests
-├── docs/                         # ARCHITECTURE, DESIGN, EVALUATION, DATA_PROFILE, PROMPT_CHANGELOG
-└── .github/workflows/evals.yml   # CI: pytest + evaluation harness, gated on pass rate
+├── .env                          # local environment file; not committed
+├── .cache/                       # LLM cache output directory
+├── .github/workflows/
+│   └── evals.yml                # CI workflow for tests + evaluation
+├── data/
+│   ├── accounts.json             # account dataset used by DataRepository
+│   └── tickets.json              # ticket dataset used by DataRepository
+├── docs/                         # architecture/design/evaluation docs
+│   ├── ARCHITECTURE.md
+│   ├── DATA_PROFILE.md
+│   ├── DESIGN.md
+│   ├── EVALUATION.md
+│   ├── PHASE_2_TRIAGE.md
+│   └── PROMPT_CHANGELOG.md
+├── knowledge-base/
+│   ├── billing/
+│   ├── onboarding/
+│   ├── products/
+│   └── troubleshooting/
+├── src/
+│   └── app/
+│       ├── __init__.py
+│       ├── __main__.py          # quick dataset/KB introspection utility
+│       ├── api.py               # FastAPI app and route handlers
+│       ├── config.py            # .env-loaded settings
+│       ├── data_repository.py   # dataset loader + account/ticket lookups
+│       ├── health_agent.py      # account health summarization
+│       ├── kb_retriever.py      # TF-IDF retrieval over Markdown KB
+│       ├── llm_client.py        # OpenRouter client, retries, caching, schema normalization
+│       ├── models.py            # Pydantic models used by API + agents
+│       ├── prompts.py           # current system prompts and prompt versions
+│       ├── triage_agent.py      # triage classification + guardrails
+│       └── evaluation/
+│           ├── cases.py         # evaluation fixtures/cases
+│           ├── runner.py        # executes evaluation cases
+│           └── scorer.py        # scoring logic
+├── run.py                        # uvicorn entrypoint for the API server
+├── ui.py                         # Gradio UI with real-time progress streaming
+├── health_check.py               # standalone simple health check
+├── test_evaluation.py            # repo-level evaluation runner check script
+├── test_openrouter.py            # OpenRouter connectivity check script
+├── test_triage.py                # triage-specific smoke check script
+├── pytest.ini                    # pytest configuration (pythonpath & test discovery)
+├── tests/
+│   ├── test_agents.py
+│   ├── test_data_repository.py
+│   └── test_kb_retriever.py
+├── eval_report.json              # latest evaluation result file
+├── requirements.txt              # Python dependencies (UTF-8 encoded)
+├── README.md                     # project overview
+└── .gitignore                    # repo ignore rules
 ```
+
+---
 
 ## ⚙️ Setup
 
@@ -127,38 +200,45 @@ Install:
 pip install -r requirements.txt
 ```
 
-Create environment configuration:
+Create a local `.env` file in the project root:
 ```bash
-cp .env.example .env   # Windows: copy .env.example .env
+# Windows
+copy NUL .env
+
+# Linux/macOS
+touch .env
 ```
 
 Set in `.env`:
-- `LLM_API_KEY`
-- `LLM_MODEL`
-- optional `LLM_BASE_URL`
+```env
+LLM_API_KEY=your-openrouter-api-key
+LLM_MODEL=z-ai/glm-5.3-flash
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_CACHE_DIR=.cache/llm
+```
 
-Never commit `.env`.
+---
 
-## ▶️ Run
+## ▶️ How the App Runs
 
-**Gradio UI (recommended):**
+The repository contains two primary entrypoints:
+
+### 1) Gradio UI (Recommended for interactive use)
 ```bash
 python ui.py
 ```
-This is the normal way to run the app. `ui.py` builds a `TestClient(app)`
-against the FastAPI app **in-process** — Gradio calls the same routing,
-Pydantic validation, and `HTTPException` handling as a deployed API, with no
-network hop and no separate server to start. You do **not** need to run
-`run.py`/`uvicorn` alongside it.
+- Opens locally at `http://127.0.0.1:7860`.
+- Features real-time status streaming, retry progress notices, elapsed timer counters, and cycling domain facts while AI reasoning executes.
+- Exercises the full FastAPI route stack in-process via `TestClient(fastapi_app)` to ensure UI and API never drift.
 
-**API standalone (optional):** only needed if something *other than this UI*
-(curl, Postman, another service) needs to call the HTTP API directly.
+### 2) FastAPI Server (Direct API mode)
 ```bash
 python run.py
 ```
-Available at `http://localhost:8000` (interactive docs at `/docs`).
+- Launches Uvicorn on `http://localhost:8000`.
+- Interactive Swagger docs available at `http://localhost:8000/docs`.
 
-### Ticket triage
+#### Ticket Triage Endpoint
 `POST /triage`
 ```json
 {
@@ -167,49 +247,60 @@ Available at `http://localhost:8000` (interactive docs at `/docs`).
 }
 ```
 
-### TAM account health
+#### TAM Account Health Endpoint
 `GET /accounts/ACC-6254/health`
 
-Returns: executive summary, account-level risk signals, evidence-backed ticket risks, TAM talking points, and the ticket join strategy used.
+Returns: executive summary, account-level risk signals, evidence-backed ticket risks, TAM talking points, and ticket join strategy used.
 
-### UI support endpoints
-- `GET /accounts` — `{account_id, company}` list, used by the UI's account dropdown.
-- `GET /accounts/{account_id}/tickets?days=90` — recent ticket history + `join_strategy` used, shown in the UI's "Recent Tickets" panel.
+#### UI Helper Endpoints
+- `GET /accounts` — `{account_id, company}` list for the UI account dropdown.
+- `GET /accounts/{account_id}/tickets?days=90` — recent ticket history with join strategy metadata.
 
-## 🧪 Evaluation & Tests
+---
 
+## 🧪 Testing & Validation Commands
+
+### Unit Tests
+Run all 12 test cases:
 ```bash
-PYTHONPATH=src python -m app.evaluation.runner
+pytest -v
 ```
-Writes `eval_report.json`. Currently 5 cases (3 triage, 2 account-health), including adversarial coverage.
 
+### Full AI Evaluation Suite
+Run the Phase 3 evaluation harness and generate `eval_report.json`:
 ```bash
-pytest -q
+python -m app.evaluation.runner
+```
+Or via the root smoke script:
+```bash
+python test_evaluation.py
 ```
 
-See [`docs/EVALUATION.md`](docs/EVALUATION.md).
+### Standalone Smoke Checks
+```bash
+python test_openrouter.py
+python test_triage.py
+python health_check.py
+```
 
-## 📚 Concepts Used
+---
 
-- Retrieval-augmented generation with citation grounding (reject unretrieved sources)
-- JSON-schema-constrained LLM output + Pydantic validation
-- Content-addressed caching (hash of model + prompts + schema)
-- Data-quality-aware entity resolution (ID join with company-name fallback)
-- Evidence-verification for LLM-generated risk claims (verbatim substring checks)
-- Reasoning-token budget management for reasoning-capable LLMs
-- CI-gated model evaluation (regression-gated deployment)
+## 📚 Concepts & Architecture Summary
 
-## 🔧 Known Gaps / Future Improvements
+- **Retrieval-Augmented Generation (RAG)**: TF-IDF chunk indexing with strict citation grounding (rejects unretrieved sources).
+- **Structured Outputs & Schema Normalization**: Pydantic v2 schemas combined with recursive JSON-schema normalization to enforce required fields across complex nested objects.
+- **Asynchronous UI Streaming**: Daemon worker threading with queue polling to stream live status and feedback in Gradio without sacrificing full-schema response validation.
+- **Content-Addressed Caching**: SHA-256 hash-keyed caching executed post-guardrail validation.
+- **Entity Resolution**: Exact `account_id` joins with company-name fallback tracking.
+- **Verbatim Evidence Verification**: Exact substring matching on all cited ticket quotes.
+- **Resilient Retry Policies**: Exponential backoff for transient provider rate limits, network timeouts, and token budget length overflows.
+- **CI/CD Quality Gates**: Automated GitHub Actions workflow testing unit suites and end-to-end evaluation metrics on push.
 
-- No authentication on the Gradio UI or FastAPI endpoints by default — `ui.py` has a commented-out `auth=` stub for Gradio's basic auth, off unless explicitly enabled via `UI_USER`/`UI_PASSWORD` env vars.
-- No streaming in the UI — `LLMClient.generate_json()` uses JSON-schema-constrained generation validated as a whole response, which isn't compatible with token-by-token streaming without breaking schema validation.
-- No `LICENSE` file in the repo — add one before treating this as reusable/open-source.
-- Evaluation harness currently covers 5 cases; broader coverage (more triage categories, more account-health edge cases) would increase confidence before any production use.
-- `.env` and `.venv/` are correctly `.gitignore`'d, but nothing prevents them from being included if the project folder is zipped/shared manually instead of pushed via git — rotate any key that's been shared this way.
+---
 
 ## 👨‍💻 Author
 
-**Tapas** — Software engineer focused on AI/ML, Generative AI, and backend/full-stack development. [github.com/Tapas2050](https://github.com/Tapas2050)
+**Tapas** — Software Engineer focused on AI/ML, Generative AI, and Backend Development. [github.com/Tapas2050](https://github.com/Tapas2050)
 
 ## ⭐
 

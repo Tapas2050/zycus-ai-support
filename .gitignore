@@ -10,3 +10,4 @@ build/
 *.egg-info/
 eval_report.json
 .cache/
+*.log

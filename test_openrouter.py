@@ -1,3 +1,8 @@
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+
 from app.llm_client import LLMClient
 from app.triage_agent import TriageResult
 

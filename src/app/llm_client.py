@@ -1,15 +1,98 @@
 import hashlib
 import json
+import time
 from pathlib import Path
 from typing import TypeVar
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    OpenAI,
+    RateLimitError,
+)
 from pydantic import BaseModel
 
 from app.config import settings
 
 
 T = TypeVar("T", bound=BaseModel)
+
+
+def _normalize_json_schema(schema: dict) -> dict:
+    """Ensure required fields are explicit for array items and nested objects.
+
+    OpenAI's structured-output JSON schema is stricter about nested required
+    fields for arrays of objects. A raw Pydantic schema often leaves array-item
+    required lists inside referenced $defs instead of the concrete `items`
+    schema, which can lead the model to omit keys like `severity` or
+    `ticket_id` from nested objects.
+    """
+    schema = json.loads(json.dumps(schema))
+    defs = schema.get("$defs", {})
+
+    def resolve_ref(ref: str) -> dict:
+        if not ref.startswith("#/$defs/"):
+            return {}
+        name = ref.split("/")[-1]
+        return defs.get(name, {})
+
+    def walk(node: dict):
+        if not isinstance(node, dict):
+            return
+
+        if "$ref" in node:
+            ref_schema = resolve_ref(node["$ref"])
+            if ref_schema:
+                node = {**ref_schema, **{k: v for k, v in node.items() if k != "$ref"}}
+                # update the caller since we merged the referenced schema in place
+                if "properties" in node:
+                    pass
+
+        properties = node.get("properties", {})
+        required = list(node.get("required", []))
+
+        for name, prop in properties.items():
+            if isinstance(prop, dict):
+                if prop.get("type") == "array":
+                    if name not in required:
+                        required.append(name)
+
+                    items = prop.get("items")
+                    if isinstance(items, dict) and "$ref" in items:
+                        ref_schema = resolve_ref(items["$ref"])
+                        if ref_schema:
+                            items = {**ref_schema, **{k: v for k, v in items.items() if k != "$ref"}}
+                            prop["items"] = items
+
+                    if isinstance(prop.get("items"), dict):
+                        walk(prop["items"])
+
+                if prop.get("type") == "object":
+                    walk(prop)
+
+                if "$ref" in prop:
+                    ref_schema = resolve_ref(prop["$ref"])
+                    if ref_schema:
+                        prop.clear()
+                        prop.update(ref_schema)
+                        walk(prop)
+
+        node["required"] = list(dict.fromkeys(required))
+
+        if isinstance(node.get("items"), dict):
+            walk(node["items"])
+
+        for child_key in ("allOf", "anyOf", "oneOf"):
+            for child in node.get(child_key, []):
+                if isinstance(child, dict):
+                    walk(child)
+
+    walk(schema)
+    for def_schema in defs.values():
+        walk(def_schema)
+
+    return schema
 
 
 class LLMClient:
@@ -80,6 +163,26 @@ class LLMClient:
             raw.encode("utf-8")
         ).hexdigest()
 
+    @staticmethod
+    def _is_retryable_error(exc: Exception) -> bool:
+        """Return True for transient provider/network failures."""
+        retryable_status_codes = {408, 409, 429, 500, 502, 503, 504}
+
+        if isinstance(
+            exc,
+            (APIConnectionError, APITimeoutError, RateLimitError),
+        ):
+            return True
+
+        if isinstance(exc, APIStatusError):
+            return exc.status_code in retryable_status_codes
+
+        status_code = getattr(exc, "status_code", None)
+        if status_code in retryable_status_codes:
+            return True
+
+        return False
+
     def generate_json(
         self,
         *,
@@ -115,26 +218,7 @@ class LLMClient:
         # 2. BUILD JSON SCHEMA
         # ---------------------------------------------------------
 
-        schema = response_model.model_json_schema()
-
-        # Pydantic omits fields with defaults from `required`, which
-        # can allow the LLM to omit list fields entirely.
-        #
-        # We explicitly add every array field to `required` so the
-        # structured-output contract requires those fields to appear.
-        required = schema.get("required", [])
-
-        for field_name, field_info in schema.get(
-            "properties",
-            {},
-        ).items():
-            if (
-                field_info.get("type") == "array"
-                and field_name not in required
-            ):
-                required.append(field_name)
-
-        schema["required"] = required
+        schema = _normalize_json_schema(response_model.model_json_schema())
 
         # ---------------------------------------------------------
         # 3. CALL OPENROUTER
@@ -153,6 +237,7 @@ class LLMClient:
         REASONING_TOKEN_CAP = 2000
         BASE_MAX_TOKENS = 8192
         RETRY_MAX_TOKENS = 16384
+        MAX_TRANSIENT_RETRIES = 3
 
         def _call(max_tokens: int):
             return self.client.chat.completions.create(
@@ -183,7 +268,22 @@ class LLMClient:
                 },
             )
 
-        response = _call(BASE_MAX_TOKENS)
+        response = None
+        last_error = None
+        for attempt in range(MAX_TRANSIENT_RETRIES + 1):
+            try:
+                response = _call(BASE_MAX_TOKENS)
+                break
+            except Exception as exc:  # pragma: no cover - exercised via live API
+                last_error = exc
+                if not self._is_retryable_error(exc) or attempt >= MAX_TRANSIENT_RETRIES:
+                    raise
+                sleep_for = (attempt + 1) * 1
+                time.sleep(sleep_for)
+
+        if response is None:
+            raise last_error
+
         message = response.choices[0].message
         content = message.content
         finish_reason = response.choices[0].finish_reason
