@@ -78,7 +78,10 @@ def _normalize_json_schema(schema: dict) -> dict:
                         prop.update(ref_schema)
                         walk(prop)
 
-        node["required"] = list(dict.fromkeys(required))
+        if node.get("type") == "object" or "properties" in node:
+            node["required"] = list(dict.fromkeys(required))
+        elif "required" in node:
+            del node["required"]
 
         if isinstance(node.get("items"), dict):
             walk(node["items"])
@@ -239,7 +242,7 @@ class LLMClient:
         RETRY_MAX_TOKENS = 11000
         MAX_TRANSIENT_RETRIES = 3
 
-        def _call_provider(max_tokens: int, extra_body: dict | None = None):
+        def _call_provider(max_tokens: int, response_format: dict, extra_body: dict | None = None):
             last_err = None
             current_max_tokens = max_tokens
             for attempt in range(MAX_TRANSIENT_RETRIES + 1):
@@ -258,13 +261,7 @@ class LLMClient:
                         ],
                         "temperature": temperature,
                         "max_tokens": current_max_tokens,
-                        "response_format": {
-                            "type": "json_schema",
-                            "json_schema": {
-                                "name": response_model.__name__,
-                                "schema": schema,
-                            },
-                        },
+                        "response_format": response_format,
                     }
                     if extra_body:
                         kwargs["extra_body"] = extra_body
@@ -283,7 +280,7 @@ class LLMClient:
             raise last_err
 
         # ---------------------------------------------------------
-        # 4. EXECUTE MODEL CALL (WITH ROBUST RETRY LOOP)
+        # 4. EXECUTE MODEL CALL (WITH ROBUST RETRY & FORMAT FALLBACK)
         # ---------------------------------------------------------
 
         last_content = ""
@@ -292,11 +289,22 @@ class LLMClient:
 
         for attempt in range(3):
             max_tokens = BASE_MAX_TOKENS if attempt == 0 else RETRY_MAX_TOKENS
-            # Attempt 0 & 1 use reasoning cap; Attempt 2 drops extra_body in case the provider has issues with it
-            extra_body = {"reasoning": {"max_tokens": REASONING_TOKEN_CAP}} if attempt < 2 else None
+            # Attempt 0 uses strict json_schema; Attempts 1-2 fall back to json_object
+            if attempt == 0:
+                resp_fmt = {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": response_model.__name__,
+                        "schema": schema,
+                    },
+                }
+                extra_body = {"reasoning": {"max_tokens": REASONING_TOKEN_CAP}}
+            else:
+                resp_fmt = {"type": "json_object"}
+                extra_body = None
 
             try:
-                response = _call_provider(max_tokens, extra_body)
+                response = _call_provider(max_tokens, resp_fmt, extra_body)
             except Exception as exc:
                 if attempt == 2:
                     raise
@@ -308,6 +316,16 @@ class LLMClient:
             finish_reason = response.choices[0].finish_reason
             last_content = content
             last_finish_reason = finish_reason
+
+            if not content:
+                # If provider returned reasoning in place of content, check for embedded JSON
+                reasoning = getattr(message, "reasoning", None) or ""
+                if "{" in reasoning and "}" in reasoning:
+                    import re
+                    match = re.search(r"(\{.*\})", reasoning, re.DOTALL)
+                    if match:
+                        content = match.group(1)
+                        last_content = content
 
             if not content:
                 time.sleep(1)
