@@ -136,12 +136,15 @@ def test_llm_schema_requires_nested_fields_for_array_items():
 
 
 def test_llm_client_retries_transient_api_failures():
+    import tempfile
+
     import app.config as config
     from app.llm_client import LLMClient
 
     object.__setattr__(config.settings, "llm_api_key", "test-key")
     object.__setattr__(config.settings, "llm_model", "test-model")
     object.__setattr__(config.settings, "llm_base_url", None)
+    object.__setattr__(config.settings, "llm_cache_dir", tempfile.mkdtemp(prefix="llm-cache-"))
 
     llm = LLMClient()
     expected = AccountHealthResult(
@@ -198,6 +201,65 @@ def test_llm_client_retries_transient_api_failures():
 
     assert result.account_id == "ACC-9999"
     assert result.account_level_risks[0].signal == "engagement_conflict"
+
+
+def test_llm_client_retries_null_provider_response():
+    import tempfile
+
+    import app.config as config
+    from app.llm_client import LLMClient
+
+    object.__setattr__(config.settings, "llm_api_key", "test-key")
+    object.__setattr__(config.settings, "llm_model", "test-model")
+    object.__setattr__(config.settings, "llm_base_url", None)
+    object.__setattr__(config.settings, "llm_cache_dir", tempfile.mkdtemp(prefix="llm-cache-"))
+
+    llm = LLMClient()
+    expected = AccountHealthResult(
+        account_id="ACC-1000",
+        executive_summary="The account remains healthy.",
+        account_level_risks=[],
+        ticket_risks=[],
+        talking_points=["Retain the current onboarding path."],
+        ticket_join_strategy="account_id",
+    )
+
+    class FakeResponse:
+        class Choice:
+            message = type(
+                "Message",
+                (),
+                {"content": expected.model_dump_json()},
+            )()
+            finish_reason = "stop"
+
+        choices = [Choice()]
+
+    class FakeCompletions:
+        def __init__(self):
+            self.calls = 0
+
+        def create(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                return None
+            return FakeResponse()
+
+    class FakeChat:
+        def __init__(self):
+            self.completions = FakeCompletions()
+
+    llm.client = type("FakeClient", (), {"chat": FakeChat()})()
+
+    result = llm.generate_json(
+        system_prompt="system prompt",
+        user_prompt="user prompt",
+        response_model=AccountHealthResult,
+        temperature=0,
+    )
+
+    assert result.account_id == "ACC-1000"
+    assert result.executive_summary == "The account remains healthy."
 
 
 def test_triage_agent_rewrites_known_issue_when_kb_only_matches_generic_performance_terms():

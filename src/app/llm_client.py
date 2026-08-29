@@ -265,7 +265,12 @@ class LLMClient:
                         "response_format": response_format,
                         "extra_body": {"reasoning": {"max_tokens": REASONING_TOKEN_CAP}},
                     }
-                    return self.client.chat.completions.create(**kwargs)
+                    response = self.client.chat.completions.create(**kwargs)
+                    if response is None:
+                        raise RuntimeError("LLM provider returned a null response object.")
+                    if not getattr(response, "choices", None):
+                        raise RuntimeError("LLM provider returned an empty choices list.")
+                    return response
                 except Exception as exc:  # pragma: no cover - exercised via live API
                     last_err = exc
                     # Handle OpenRouter 402 credit limit by clamping to affordable tokens
@@ -314,9 +319,16 @@ class LLMClient:
                 time.sleep(1)
                 continue
 
-            message = response.choices[0].message
+            if not getattr(response, "choices", None):
+                raise RuntimeError("LLM provider returned an empty choices list.")
+
+            choice = response.choices[0]
+            message = getattr(choice, "message", None)
+            if message is None:
+                raise RuntimeError("LLM provider returned a choice without a message payload.")
+
             content = message.content or ""
-            finish_reason = response.choices[0].finish_reason
+            finish_reason = getattr(choice, "finish_reason", None)
             last_content = content
             last_finish_reason = finish_reason
 
