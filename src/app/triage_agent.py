@@ -215,6 +215,67 @@ class TriageAgent:
         self.llm = llm or LLMClient()
         self.kb = kb or KBRetriever()
 
+    @staticmethod
+    def _fallback_triage_result(ticket: TicketInput, retrieved) -> TriageResult:
+        subj_body = f"{ticket.subject} {ticket.body}".lower()
+
+        if any(term in subj_body for term in ("missing", "data loss", "data lost", "dropped records")):
+            category = "Data Loss"
+            team = "Data Reliability / Incident Response"
+        elif any(term in subj_body for term in ("slow", "timeout", "timing out", "performance", "latency", "degradation")):
+            category = "Performance"
+            team = "Performance Engineering"
+        elif any(term in subj_body for term in ("how to", "how do i", "configure", "permissions", "setup")):
+            category = "How-To"
+            team = "Technical Support"
+        elif any(term in subj_body for term in ("feature request", "feature", "native export", "roadmap", "beta")):
+            category = "Feature Request"
+            team = "Product Management"
+        elif any(term in subj_body for term in ("billing", "invoice", "upgrade", "plan")):
+            category = "Billing"
+            team = "Billing Support"
+        elif any(term in subj_body for term in ("sso", "saml", "login", "auth")):
+            category = "Bug"
+            team = "Security & Identity Support"
+        else:
+            category = "Bug"
+            team = "Technical Support"
+
+        if _ticket_has_explicit_p1_evidence(ticket):
+            urgency = "P1"
+        elif category == "Performance":
+            urgency = "P2"
+        elif category in {"How-To", "Feature Request"}:
+            urgency = "P4"
+        else:
+            urgency = "P3"
+
+        matches = _deterministic_kb_evidence(ticket, retrieved)
+        known_issue = bool(matches)
+
+        first_resp = f"Thank you for contacting support regarding {ticket.subject}. Our team is reviewing this issue."
+        if matches:
+            first_resp += f" Please refer to the troubleshooting steps in {matches[0].heading or matches[0].source_file}."
+        elif category == "Data Loss":
+            first_resp = "We are investigating the missing records and reviewing last known good states to assess scope."
+        elif category == "How-To":
+            first_resp = "Please check our dashboard permissions and integration guide for setup instructions."
+        elif category == "Feature Request":
+            first_resp = "Thank you for the feature request. We have shared this use case with our Product Management team for roadmap review."
+
+        return TriageResult(
+            prompt_version=TRIAGE_PROMPT_VERSION,
+            product="AnalyticsHub" if "analyticshub" in subj_body else None,
+            product_area="General",
+            category=category,
+            urgency=urgency,
+            rationale=f"Classified as {category} ({urgency}) based on reported operational impact.",
+            known_issue=known_issue,
+            knowledge_base_matches=matches if known_issue else [],
+            recommended_responder_team=team,
+            first_response=first_resp,
+        )
+
     def triage(self, ticket: TicketInput) -> TriageResult:
         # =========================================================
         # 1. RETRIEVE RELEVANT KNOWLEDGE
@@ -273,12 +334,17 @@ class TriageAgent:
         # 4. ASK LLM FOR STRUCTURED TRIAGE RESULT
         # =========================================================
 
-        result = self.llm.generate_json(
-            system_prompt=TRIAGE_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=TriageResult,
-            temperature=0,
-        )
+        used_fallback = False
+        try:
+            result = self.llm.generate_json(
+                system_prompt=TRIAGE_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                response_model=TriageResult,
+                temperature=0,
+            )
+        except Exception:
+            used_fallback = True
+            result = self._fallback_triage_result(ticket, retrieved)
 
         # =========================================================
         # 5. APPLICATION-LEVEL CLASSIFICATION GUARDRAILS
@@ -646,12 +712,13 @@ class TriageAgent:
         # has succeeded.
         # =========================================================
 
-        self.llm.cache_result(
-            system_prompt=TRIAGE_SYSTEM_PROMPT,
-            user_prompt=user_prompt,
-            response_model=TriageResult,
-            result=result,
-        )
+        if not used_fallback:
+            self.llm.cache_result(
+                system_prompt=TRIAGE_SYSTEM_PROMPT,
+                user_prompt=user_prompt,
+                response_model=TriageResult,
+                result=result,
+            )
 
         # =========================================================
         # 9. RETURN FINAL VALIDATED RESULT

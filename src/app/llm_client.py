@@ -305,10 +305,13 @@ class LLMClient:
                         "configured token budget."
                     ) from exc
                 model_unavailable = (
-                    self.fallback_model
-                    and status_code == 404
-                    and "model" in error_text.lower()
-                    and "unavailable" in error_text.lower()
+                    status_code == 404
+                    and (
+                        self.fallback_model
+                        or "provider" in error_text.lower()
+                        or "model" in error_text.lower()
+                        or "unavailable" in error_text.lower()
+                    )
                 )
                 if (
                     not self._is_retryable_error(exc)
