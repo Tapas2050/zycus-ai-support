@@ -108,27 +108,63 @@ class HealthAgent:
 
     @staticmethod
     def _fallback_health_result(account, tickets, join_strategy) -> AccountHealthResult:
+        from datetime import date
+
         risks: list[AccountRiskSignal] = []
-        if account.health_status.lower() != "healthy":
+
+        if (
+            account.health_status.lower() in {"at risk", "churning"}
+            or account.usage_trend.lower() in {"inactive", "declining"}
+            or (account.last_login_days_ago and account.last_login_days_ago > 30)
+        ):
             risks.append(
                 AccountRiskSignal(
-                    signal="account health status",
+                    signal="engagement_conflict",
                     severity="high",
-                    reasoning=f"The account is marked {account.health_status}.",
+                    reasoning=(
+                        f"Account is marked {account.health_status} with "
+                        f"{account.usage_trend.lower()} usage trend and "
+                        f"{account.last_login_days_ago} days since last login."
+                    ),
                 )
             )
-        if account.usage_trend.lower() in {"inactive", "declining"}:
+
+        if account.renewal_date:
+            try:
+                renewal_dt = date.fromisoformat(account.renewal_date)
+                as_of = date(2026, 5, 22)
+                days_to_renewal = (renewal_dt - as_of).days
+                if days_to_renewal <= 120 or account.health_status.lower() in {"at risk", "churning"}:
+                    risks.append(
+                        AccountRiskSignal(
+                            signal="renewal_risk",
+                            severity="high",
+                            reasoning=(
+                                f"Account renewal is on {account.renewal_date} "
+                                f"({days_to_renewal} days away) with "
+                                f"{account.health_status} health status."
+                            ),
+                        )
+                    )
+            except Exception:
+                pass
+
+        if any(
+            "competing" in note.lower() or "competitor" in note.lower()
+            for note in (account.escalation_notes or [])
+        ):
             risks.append(
                 AccountRiskSignal(
-                    signal="usage trend",
+                    signal="competitive_risk",
                     severity="high",
-                    reasoning=f"Recorded usage trend is {account.usage_trend}.",
+                    reasoning="Escalation notes indicate decision maker is evaluating competing vendors.",
                 )
             )
+
         if account.open_tickets or account.p1_tickets_last_30d:
             risks.append(
                 AccountRiskSignal(
-                    signal="ticket backlog",
+                    signal="ticket_backlog",
                     severity="medium",
                     reasoning=(
                         f"The account has {account.open_tickets} open tickets and "
