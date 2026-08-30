@@ -11,7 +11,11 @@ jobs:
     env:
       LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
       LLM_MODEL: ${{ secrets.LLM_MODEL }}
+      LLM_FALLBACK_MODEL: ${{ secrets.LLM_FALLBACK_MODEL }}
       LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+      LLM_TIMEOUT_SECONDS: ${{ secrets.LLM_TIMEOUT_SECONDS || '60' }}
+      API_AUTH_TOKEN: ${{ secrets.API_AUTH_TOKEN }}
+      API_RATE_LIMIT_PER_MINUTE: ${{ secrets.API_RATE_LIMIT_PER_MINUTE || '60' }}
       PYTHONPATH: ${{ github.workspace }}/src
 
     steps:
@@ -32,6 +36,14 @@ jobs:
 
       - name: Run AI evaluation harness
         run: python -m app.evaluation.runner
+
+      - name: Upload evaluation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: eval-report
+          path: eval_report.json
+          if-no-files-found: warn
 
       - name: Verify evaluation results
         run: |

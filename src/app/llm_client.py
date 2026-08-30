@@ -125,9 +125,11 @@ class LLMClient:
         self.client = OpenAI(
             api_key=settings.llm_api_key,
             base_url=settings.llm_base_url,
+            timeout=getattr(settings, "llm_timeout_seconds", 60.0),
         )
 
         self.model = settings.llm_model
+        self.fallback_model = getattr(settings, "llm_fallback_model", None)
 
         self.cache_dir = Path(
             getattr(settings, "llm_cache_dir", ".cache/llm")
@@ -225,124 +227,112 @@ class LLMClient:
         schema = _normalize_json_schema(response_model.model_json_schema())
 
         # ---------------------------------------------------------
-        # 3. CALL OPENROUTER
+        # 3. CALL PROVIDER
         # ---------------------------------------------------------
         #
-        # Reasoning models (e.g. glm-5.3-flash) spend part of
-        # max_tokens on an internal reasoning trace before writing
-        # the structured JSON. If reasoning runs long, it can
-        # consume the entire budget and leave zero tokens for the
-        # actual output (finish_reason="length", content=None).
-        #
-        # We cap reasoning tokens explicitly so content always has
-        # room, and retry once with a larger budget if truncation
-        # still happens (e.g. on data-heavy accounts).
+        # Nemotron 3 Ultra (and similar frontier reasoning models)
+        # handle their own internal reasoning traces without needing
+        # an explicit cap parameter.  We give a generous max_tokens
+        # budget so large health-agent prompts (90-day ticket
+        # history) have enough room for both reasoning + output.
 
-        REASONING_TOKEN_CAP = 150
-        BASE_MAX_TOKENS = 2500
-        RETRY_MAX_TOKENS = 3000
-        MAX_TRANSIENT_RETRIES = 3
+        BASE_MAX_TOKENS = 4000
+        MAX_ATTEMPTS = 3
+        RETRY_DELAYS = (1, 2)
 
-        def _call_provider(max_tokens: int, response_format: dict):
-            last_err = None
-            current_max_tokens = max_tokens
-            for attempt in range(MAX_TRANSIENT_RETRIES + 1):
-                try:
-                    kwargs = {
-                        "model": self.model,
-                        "messages": [
-                            {
-                                "role": "system",
-                                "content": system_prompt,
-                            },
-                            {
-                                "role": "user",
-                                "content": user_prompt,
-                            },
-                        ],
-                        "temperature": temperature,
-                        "max_tokens": current_max_tokens,
-                        "response_format": response_format,
-                        "extra_body": {"reasoning": {"max_tokens": REASONING_TOKEN_CAP}},
-                    }
-                    response = self.client.chat.completions.create(**kwargs)
-                    if response is None:
-                        raise RuntimeError("LLM provider returned a null response object.")
-                    if not getattr(response, "choices", None):
-                        raise RuntimeError("LLM provider returned an empty choices list.")
-                    return response
-                except Exception as exc:  # pragma: no cover - exercised via live API
-                    last_err = exc
-                    err_str = str(exc)
-                    if (
-                        isinstance(exc, RuntimeError)
-                        and (
-                            "empty choices list" in err_str
-                            or "null response object" in err_str
-                            or "choice without a message payload" in err_str
-                        )
-                    ):
-                        if attempt >= MAX_TRANSIENT_RETRIES:
-                            raise
-                        time.sleep((attempt + 1) * 1)
-                        continue
-                    # Handle OpenRouter 402 credit limit by clamping to affordable tokens
-                    if getattr(exc, "status_code", None) == 402 or "402" in err_str or "fewer max_tokens" in err_str:
-                        import re
-                        afford_match = re.search(r"can only afford (\d+)", err_str)
-                        if afford_match:
-                            current_max_tokens = max(500, int(afford_match.group(1)) - 50)
-                        else:
-                            current_max_tokens = min(current_max_tokens, 1500)
-                        time.sleep(1)
-                        continue
-                    if not self._is_retryable_error(exc) or attempt >= MAX_TRANSIENT_RETRIES:
-                        raise
-                    time.sleep((attempt + 1) * 1)
-            raise last_err
+        def _call_provider(max_tokens: int, response_format: dict, model: str):
+            kwargs = {
+                "model": model,
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": system_prompt,
+                    },
+                    {
+                        "role": "user",
+                        "content": user_prompt,
+                    },
+                ],
+                "temperature": temperature,
+                "max_tokens": max_tokens,
+                "response_format": response_format,
+            }
+            response = self.client.chat.completions.create(**kwargs)
+            if response is None:
+                raise RuntimeError("LLM provider returned a null response object.")
+            if not getattr(response, "choices", None):
+                raise RuntimeError("LLM provider returned an empty choices list.")
+            return response
 
         # ---------------------------------------------------------
-        # 4. EXECUTE MODEL CALL (WITH ROBUST RETRY & FORMAT FALLBACK)
+        # 4. EXECUTE ONE BOUNDED RETRY LOOP
         # ---------------------------------------------------------
 
         last_content = ""
         last_finish_reason = None
         last_validation_exc = None
 
-        for attempt in range(3):
-            max_tokens = BASE_MAX_TOKENS if attempt == 0 else RETRY_MAX_TOKENS
-            # Attempt 0 uses strict json_schema; Attempts 1-2 fall back to json_object
-            if attempt == 0:
-                resp_fmt = {
-                    "type": "json_schema",
-                    "json_schema": {
-                        "name": response_model.__name__,
-                        "schema": schema,
-                    },
-                }
-            else:
-                resp_fmt = {"type": "json_object"}
+        resp_fmt = {
+            "type": "json_schema",
+            "json_schema": {
+                "name": response_model.__name__,
+                "schema": schema,
+            },
+        }
+
+        for attempt in range(MAX_ATTEMPTS):
+            max_tokens = BASE_MAX_TOKENS
+            model = (
+                self.fallback_model
+                if attempt > 0 and self.fallback_model
+                else self.model
+            )
 
             try:
-                response = _call_provider(max_tokens, resp_fmt)
+                response = _call_provider(max_tokens, resp_fmt, model)
             except Exception as exc:
-                if attempt == 2:
+                status_code = getattr(exc, "status_code", None)
+                error_text = str(exc)
+                is_credit_error = (
+                    status_code == 402
+                    or "402" in error_text
+                    or "fewer max_tokens" in error_text
+                )
+                if is_credit_error:
+                    raise RuntimeError(
+                        "LLM provider rejected the request because the account "
+                        "does not have enough credits. Add credits or lower the "
+                        "configured token budget."
+                    ) from exc
+                model_unavailable = (
+                    self.fallback_model
+                    and status_code == 404
+                    and "model" in error_text.lower()
+                    and "unavailable" in error_text.lower()
+                )
+                if (
+                    not self._is_retryable_error(exc)
+                    and not isinstance(exc, RuntimeError)
+                    and not model_unavailable
+                ):
                     raise
-                time.sleep(1)
+                if attempt == MAX_ATTEMPTS - 1:
+                    raise
+                time.sleep(RETRY_DELAYS[attempt])
                 continue
 
             if not getattr(response, "choices", None):
-                if attempt == 2:
+                if attempt == MAX_ATTEMPTS - 1:
                     raise RuntimeError("LLM provider returned an empty choices list.")
-                time.sleep(1)
+                time.sleep(RETRY_DELAYS[attempt])
                 continue
 
             choice = response.choices[0]
             message = getattr(choice, "message", None)
             if message is None:
-                if attempt == 2:
+                if attempt == MAX_ATTEMPTS - 1:
                     raise RuntimeError("LLM provider returned a choice without a message payload.")
-                time.sleep(1)
+                time.sleep(RETRY_DELAYS[attempt])
                 continue
 
             content = message.content or ""
@@ -361,7 +351,8 @@ class LLMClient:
                         last_content = content
 
             if not content:
-                time.sleep(1)
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(RETRY_DELAYS[attempt])
                 continue
 
             # Strip markdown code blocks or surrounding prose if present
@@ -381,11 +372,11 @@ class LLMClient:
 
             try:
                 result = response_model.model_validate_json(clean_content)
-                cache_path.write_text(clean_content, encoding="utf-8")
                 return result
             except Exception as exc:
                 last_validation_exc = exc
-                time.sleep(1)
+                if attempt < MAX_ATTEMPTS - 1:
+                    time.sleep(RETRY_DELAYS[attempt])
                 continue
 
         # ---------------------------------------------------------
@@ -402,7 +393,7 @@ class LLMClient:
         print("\n===== INVALID JSON DEBUG =====")
         print(f"Model: {self.model}")
         print(f"Finish reason: {last_finish_reason}")
-        print(f"Content: {repr(last_content)}")
+        print(f"Content: {last_content.encode('ascii', errors='backslashreplace').decode('ascii')}")
         print("==============================\n")
         raise RuntimeError("LLM returned invalid structured output.") from last_validation_exc
 

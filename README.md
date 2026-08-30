@@ -20,7 +20,7 @@ The crucial design constraint is **strict validation**: the app rejects invalid 
 | **Language** | Python 3.11+ |
 | **Backend API** | FastAPI, Uvicorn, Pydantic v2 |
 | **UI & UX** | Gradio 6.x (Blocks, background streaming generator workers, queue polling, custom CSS keyframe animations) |
-| **LLM / Structured Output** | OpenAI SDK → OpenRouter (`z-ai/glm-5.3-flash`), JSON-schema-constrained generation, reasoning-token budget management, content-addressed on-disk caching |
+| **LLM / Structured Output** | OpenAI SDK → OpenRouter (model selected through `LLM_MODEL`), JSON-schema-constrained generation, bounded retries, explicit request timeout, content-addressed on-disk caching |
 | **Retrieval** | scikit-learn (`TfidfVectorizer` + cosine similarity) over local Markdown knowledge base |
 | **Testing** | pytest, `pytest.ini`, unittest.mock |
 | **CI/CD** | GitHub Actions (`.github/workflows/evals.yml`) with automated evaluation gates |
@@ -78,9 +78,9 @@ data/accounts.json + data/tickets.json
         │      - renders validated markdown + formatted raw JSON results
         │
         └── Evaluation harness
-               - tests/ unit tests (12 test cases)
+               - tests/ unit tests
                - src/app/evaluation/runner.py
-               - writes eval_report.json (100% quality score)
+               - writes eval_report.json
 ```
 
 ---
@@ -96,11 +96,11 @@ data/accounts.json + data/tickets.json
 - 🔗 **Data-quality-aware ticket/account matching** — `DataRepository` resolves account/ticket relations using the real dataset, and the repo’s health flow records the selected strategy (`account_id` vs fallback behavior) through the response contract rather than silently hiding it.
 - 📎 **Evidence-verification for ticket risks** — `HealthAgent` requires every `evidence_quote` to be an exact substring of the source ticket body. This is enforced in code before the response is accepted.
 - 💾 **Guardrail-gated on-disk caching** — `LLMClient` creates a SHA-256 content-addressed hash from model + prompt + schema and stores output under `.cache/llm/`. Caching is intentionally deferred until *after* all semantic guardrails pass, preventing bad or unvalidated responses from being permanently saved.
-- 🛡️ **Transient retry & token budget resilience** — `LLMClient.generate_json()` retries on provider/network failures (`APITimeoutError`, `APIConnectionError`, `RateLimitError`, and 5xx/429 status codes). It also detects reasoning-token budget exhaustion (`finish_reason="length"`) and retries with an expanded token budget.
+- 🛡️ **Bounded provider retry** — `LLMClient.generate_json()` makes at most three attempts, retries transient provider/network failures, uses a configurable request timeout, and fails credit/quota errors immediately. Retries keep the same strict JSON schema.
 - 🔒 **Structured-output schema normalization** — `_normalize_json_schema()` explicitly adjusts nested array-item requirements to resolve Pydantic default-factory behaviors and ensure array fields (like `knowledge_base_matches` and `ticket_risks`) are treated as required by strict LLMs.
 - 🚫 **Module/operation guardrails** — `TriageAgent` checks the relationship between a retrieved KB chunk and the ticket’s operating context so a generic KB hit cannot be treated as a valid answer for a different product area or operation.
 - 🖥️ **UI uses the real API path** — `ui.py` instantiates `TestClient(fastapi_app)` from `src/app/api.py`; the UI is not calling repository classes directly. Each Gradio action hits the FastAPI endpoints with validation/error handling intact.
-- 🧪 **Code-driven evaluation suite** — Includes 12 unit tests and a dedicated evaluation harness in `src/app/evaluation/runner.py` testing standard and adversarial scenarios, writing `eval_report.json`.
+- 🧪 **Code-driven evaluation suite** — Includes unit tests and 11 evaluation cases (6 triage, 5 account health), including adversarial scenarios, writing `eval_report.json`.
 
 ---
 
@@ -110,11 +110,11 @@ From `eval_report.json`:
 
 | Metric | Value |
 |---|---|
-| Total cases | 5 (3 triage, 2 account-health) |
-| Passed | 5 / 5 |
-| Overall quality score | 100.0% (1.0) |
+| Total cases | 11 (6 triage, 5 account-health) |
+| Passed | Depends on the configured provider and current run |
+| Overall quality score | Reported by the current `eval_report.json` |
 | Adversarial coverage | ✅ (e.g. `healthy_account_with_customer_declared_p1` — account metadata says "Healthy" while a ticket body declares a P1) |
-| Test suite status | ✅ 12 passed in `pytest` |
+| Test suite status | Run `pytest` to verify the current checkout |
 
 ---
 
@@ -212,10 +212,19 @@ touch .env
 Set in `.env`:
 ```env
 LLM_API_KEY=your-openrouter-api-key
-LLM_MODEL=z-ai/glm-5.3-flash
+LLM_MODEL=your-openrouter-model-id
+LLM_FALLBACK_MODEL=optional-fallback-model-id
 LLM_BASE_URL=https://openrouter.ai/api/v1
 LLM_CACHE_DIR=.cache/llm
+LLM_TIMEOUT_SECONDS=60
+# Optional API protection
+API_AUTH_TOKEN=replace-with-a-secret-token
+API_RATE_LIMIT_PER_MINUTE=60
 ```
+
+`API_AUTH_TOKEN` enables `X-API-Key` authentication for API routes other than
+`/health`. The in-memory rate limit is per client host and is intended for a
+single-process deployment; use an external gateway for distributed rate limiting.
 
 ---
 
@@ -261,7 +270,7 @@ Returns: executive summary, account-level risk signals, evidence-backed ticket r
 ## 🧪 Testing & Validation Commands
 
 ### Unit Tests
-Run all 12 test cases:
+Run all unit tests:
 ```bash
 pytest -v
 ```
@@ -293,7 +302,7 @@ python health_check.py
 - **Content-Addressed Caching**: SHA-256 hash-keyed caching executed post-guardrail validation.
 - **Entity Resolution**: Exact `account_id` joins with company-name fallback tracking.
 - **Verbatim Evidence Verification**: Exact substring matching on all cited ticket quotes.
-- **Resilient Retry Policies**: Exponential backoff for transient provider rate limits, network timeouts, and token budget length overflows.
+- **Resilient Retry Policies**: Bounded backoff for transient provider failures, with optional final-attempt fallback model support.
 - **CI/CD Quality Gates**: Automated GitHub Actions workflow testing unit suites and end-to-end evaluation metrics on push.
 
 ---

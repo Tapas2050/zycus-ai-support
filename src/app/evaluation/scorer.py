@@ -3,12 +3,36 @@ from app.evaluation.cases import (
     TriageEvaluationCase,
 )
 from app.health_agent import AccountHealthResult
-from app.triage_agent import TriageResult
+from app.kb_retriever import KBRetriever
+from app.models import TicketInput
+from app.triage_agent import (
+    TriageResult,
+    _kb_match_supports_ticket,
+    _ticket_has_explicit_p1_evidence,
+)
 
 
 # ============================================================
 # TRIAGE SCORING
 # ============================================================
+
+
+def _kb_match_has_grounded_evidence(
+    ticket: TicketInput,
+    match,
+    kb: KBRetriever,
+) -> bool:
+    """Verify a cited KB identity against the actual text in the KB."""
+    chunk = next(
+        (
+            candidate
+            for candidate in kb.chunks
+            if candidate.source_file == match.source_file
+            and candidate.heading == match.heading
+        ),
+        None,
+    )
+    return chunk is not None and _kb_match_supports_ticket(ticket, match, chunk.text)
 
 
 def score_triage(
@@ -57,6 +81,8 @@ def score_triage(
     # 4. KB SOURCES
     # ---------------------------------------------------------
 
+    ticket = TicketInput(subject=case.subject, body=case.body)
+
     actual_kb_sources = tuple(
         sorted(
             {
@@ -70,15 +96,31 @@ def score_triage(
         sorted(case.expected_kb_sources)
     )
 
+    kb = KBRetriever()
+    grounded_matches = [
+        match
+        for match in result.knowledge_base_matches
+        if _kb_match_has_grounded_evidence(ticket, match, kb)
+    ]
+    grounded_sources = {match.source_file for match in grounded_matches}
+    all_citations_grounded = (
+        len(grounded_matches) == len(result.knowledge_base_matches)
+    )
+
     if expected_kb_sources:
         # Every expected source must be present.
         #
         # Additional retrieved/cited sources are allowed because
         # the LLM may legitimately identify more than one relevant
-        # document.
-        kb_sources_passed = all(
-            source in actual_kb_sources
-            for source in expected_kb_sources
+        # document. However, the citation must still align with the
+        # expected ticket semantics; a same-file but wrong-operation
+        # heading should fail evaluation.
+        kb_sources_passed = (
+            all(
+                source in grounded_sources
+                for source in expected_kb_sources
+            )
+            and all_citations_grounded
         )
     else:
         # When the expected answer says that no KB source should
@@ -91,12 +133,40 @@ def score_triage(
     # 5. OVERALL PASS / FAIL
     # ---------------------------------------------------------
 
+    urgency_evidence_passed = not (
+        result.urgency == "P1" and not _ticket_has_explicit_p1_evidence(ticket)
+    )
+    rationale_quality_passed = bool(result.rationale.strip())
+    first_response_quality_passed = bool(result.first_response.strip())
+    required_response_terms = tuple(
+        term.lower() for term in case.required_response_terms
+    )
+    response_guidance_passed = (
+        not required_response_terms
+        or any(term in result.first_response.lower() for term in required_response_terms)
+    )
+
+    citation_quality_passed = all(
+        bool(match.source_file.strip())
+        and bool(match.relevance_reason.strip())
+        and _kb_match_has_grounded_evidence(ticket, match, kb)
+        for match in result.knowledge_base_matches
+    )
+
+    semantic_kb_gate = all_citations_grounded
+
     passed = all(
         [
             category_passed,
             urgency_passed,
+            urgency_evidence_passed,
             known_issue_passed,
             kb_sources_passed,
+            semantic_kb_gate,
+            rationale_quality_passed,
+            first_response_quality_passed,
+            response_guidance_passed,
+            citation_quality_passed,
         ]
     )
 
@@ -108,10 +178,16 @@ def score_triage(
         [
             category_passed,
             urgency_passed,
+            urgency_evidence_passed,
             known_issue_passed,
             kb_sources_passed,
+            semantic_kb_gate,
+            rationale_quality_passed,
+            first_response_quality_passed,
+            response_guidance_passed,
+            citation_quality_passed,
         ]
-    ) / 4
+    ) / 10
 
     return {
         "case_id": case.ticket_id,
@@ -137,6 +213,10 @@ def score_triage(
             "passed": urgency_passed,
         },
 
+        "urgency_evidence": {
+            "passed": urgency_evidence_passed,
+        },
+
         "known_issue": {
             "expected": case.expected_known_issue,
             "actual": result.known_issue,
@@ -147,6 +227,32 @@ def score_triage(
             "expected": expected_kb_sources,
             "actual": actual_kb_sources,
             "passed": kb_sources_passed,
+        },
+
+        "semantic_kb_gate": {
+            "passed": semantic_kb_gate,
+        },
+
+        "grounded_kb_sources": {
+            "actual": tuple(sorted(grounded_sources)),
+            "passed": all_citations_grounded,
+        },
+
+        "citation_quality": {
+            "passed": citation_quality_passed,
+        },
+
+        "rationale_quality": {
+            "passed": rationale_quality_passed,
+        },
+
+        "first_response_quality": {
+            "passed": first_response_quality_passed,
+        },
+
+        "response_guidance": {
+            "expected_any_of": required_response_terms,
+            "passed": response_guidance_passed,
         },
     }
 

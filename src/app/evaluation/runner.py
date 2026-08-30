@@ -25,6 +25,12 @@ def run(output_path: str = "eval_report.json") -> dict:
     A JSON report is written to output_path.
     """
 
+    if len(TRIAGE_CASES) < 5 or len(HEALTH_CASES) < 5:
+        raise RuntimeError(
+            "Evaluation requires at least five cases per task: "
+            f"triage={len(TRIAGE_CASES)}, health={len(HEALTH_CASES)}."
+        )
+
     # ---------------------------------------------------------
     # STEP 1: Load the dataset once
     # ---------------------------------------------------------
@@ -42,13 +48,11 @@ def run(output_path: str = "eval_report.json") -> dict:
     )
 
     # ---------------------------------------------------------
-    # STEP 3: Build a ticket lookup table
+    # STEP 3: Evaluate the exact fixture payload
     # ---------------------------------------------------------
 
-    ticket_map = {
-        ticket.ticket_id: ticket
-        for ticket in repo.tickets
-    }
+    # A case owns both its expected result and its input text. Fixture and
+    # dataset text can legitimately diverge as adversarial coverage evolves.
 
     # ---------------------------------------------------------
     # STEP 4: Evaluate Triage cases
@@ -57,20 +61,23 @@ def run(output_path: str = "eval_report.json") -> dict:
     results = []
 
     for case in TRIAGE_CASES:
-
-        ticket = ticket_map[case.ticket_id]
-
-        result = triage.triage(
-            TicketInput(
-                subject=ticket.subject,
-                body=ticket.body,
+        try:
+            result = triage.triage(
+                TicketInput(
+                    subject=case.subject,
+                    body=case.body,
+                )
             )
-        )
-
-        scored_result = score_triage(
-            result,
-            case,
-        )
+            scored_result = score_triage(result, case)
+        except Exception as exc:
+            scored_result = {
+                "case_id": case.ticket_id,
+                "case_name": case.name,
+                "adversarial": getattr(case, "adversarial", False),
+                "passed": False,
+                "quality_score": 0.0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
         results.append(scored_result)
 
@@ -79,15 +86,18 @@ def run(output_path: str = "eval_report.json") -> dict:
     # ---------------------------------------------------------
 
     for case in HEALTH_CASES:
-
-        result = health.summarise(
-            case.account_id
-        )
-
-        scored_result = score_health(
-            result,
-            case,
-        )
+        try:
+            result = health.summarise(case.account_id)
+            scored_result = score_health(result, case)
+        except Exception as exc:
+            scored_result = {
+                "case_id": case.account_id,
+                "case_name": case.name,
+                "adversarial": getattr(case, "adversarial", False),
+                "passed": False,
+                "quality_score": 0.0,
+                "error": f"{type(exc).__name__}: {exc}",
+            }
 
         results.append(scored_result)
 

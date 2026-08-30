@@ -16,10 +16,10 @@ agent = HealthAgent()
 
 if len(sys.argv) != 2:
     print(
-        "Usage: python test_health.py <account_id>"
+        "Usage: python health_check.py <account_id>"
     )
     print(
-        "Example: python test_health.py ACC-3336"
+        "Example: python health_check.py ACC-3336"
     )
     sys.exit(1)
 

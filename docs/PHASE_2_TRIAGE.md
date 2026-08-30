@@ -33,4 +33,25 @@ TriageResult
 
 ## Prompt versioning
 
-`triage-v1.2` is included in the output so prompt changes can be tracked later.
+`triage-v1.5` is included in the output so prompt changes can be tracked later.
+
+The active prompt requires operation-level evidence matching before
+`known_issue=true` is allowed. A generic product-level performance document is
+not sufficient when the ticket identifies a different module or workflow.
+
+The final response has a strict two-way evidence invariant:
+
+- `known_issue=true` requires at least one retrieved, semantically supporting
+  KB citation.
+- `known_issue=false` requires `knowledge_base_matches=[]`.
+
+Each citation must exactly identify a retrieved `(source_file, heading)` pair.
+The application checks the cited chunk's text against the ticket; filenames,
+headings, product overlap, and model-written relevance reasons are not enough
+on their own.
+
+The final `known_issue` value is derived after generation from the retrieved
+chunk text using deterministic product, operation, and symptom checks. The LLM
+can provide the classification and response wording, but cannot turn a
+non-matching KB result into a known issue or suppress a matching documented
+pattern.

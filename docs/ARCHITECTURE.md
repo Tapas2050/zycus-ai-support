@@ -54,8 +54,10 @@ by the UI:
 
 The supplied Markdown corpus is small, so retrieval stays local and deterministic.
 Documents are split at Markdown heading boundaries (while preserving the original
-source file and heading as metadata), indexed with TF-IDF, and ranked with a small
-exact-error-code boost plus an optional product-name boost.
+source file and heading as metadata), indexed with TF-IDF, and ranked with
+deterministic error-code, product, heading, and document-family signals.
+Operational queries restrict candidates to troubleshooting chunks when that corpus
+is available, and a minimum score prevents weak matches from entering the prompt.
 
 This is deliberately simpler than introducing a hosted vector database for a
 four-hour take-home.

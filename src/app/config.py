@@ -13,8 +13,12 @@ class Settings:
     knowledge_base_dir: str = os.getenv("KNOWLEDGE_BASE_DIR", "knowledge-base")
     llm_api_key: str | None = os.getenv("LLM_API_KEY")
     llm_model: str | None = os.getenv("LLM_MODEL")
+    llm_fallback_model: str | None = os.getenv("LLM_FALLBACK_MODEL")
     llm_base_url: str | None = os.getenv("LLM_BASE_URL")
     llm_cache_dir: str = os.getenv("LLM_CACHE_DIR", ".cache/llm")
+    llm_timeout_seconds: float = float(os.getenv("LLM_TIMEOUT_SECONDS", "60"))
+    api_auth_token: str | None = os.getenv("API_AUTH_TOKEN")
+    api_rate_limit_per_minute: int = int(os.getenv("API_RATE_LIMIT_PER_MINUTE", "60"))
     data_as_of: str | None = os.getenv("DATA_AS_OF")
 
 

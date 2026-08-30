@@ -13,7 +13,7 @@ AnalyticsHub is a self-serve business intelligence platform that connects to liv
 
 ### Dashboard
 
-Interactive visualisation canvas. Supports charts (line, bar, scatter, pie, heatmap), KPI tiles, data tables, and embedded SQL views.
+Interactive visualisation canvas. Supports charts (line, bar, scatter, pie, heatmap), KPI tiles, data tables, and embedded SQL views.Live 11-case evaluation:
 
 - **Performance note:** dashboards with more than 20 widgets or queries spanning > 12 months of data may load slowly. Use the Query Optimiser (Settings → Performance → Optimise) before publishing.
 - Auto-refresh interval: configurable from 1 minute to 24 hours.

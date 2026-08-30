@@ -381,12 +381,26 @@ class KBRetriever:
         # 6. RANK RESULTS
         # ---------------------------------------------------------
 
-        ranked = scores.argsort()[::-1][:top_k]
+        candidate_indexes = list(range(len(self.chunks)))
+        if document_type == "troubleshooting":
+            troubleshooting_indexes = [
+                i
+                for i, chunk in enumerate(self.chunks)
+                if "/troubleshooting/" in chunk.source_file
+                and scores[i] > 0
+            ]
+            if troubleshooting_indexes:
+                candidate_indexes = troubleshooting_indexes
+
+        ranked = sorted(
+            candidate_indexes,
+            key=lambda i: (-float(scores[i]), self.chunks[i].chunk_id),
+        )[:top_k]
 
         return [
             (self.chunks[i], float(scores[i]))
             for i in ranked
-            if scores[i] > 0
+            if scores[i] >= 0.15
         ]
 
     def format_context(

@@ -1,4 +1,4 @@
-TRIAGE_PROMPT_VERSION = "triage-v1.4"
+TRIAGE_PROMPT_VERSION = "triage-v1.5"
 
 TRIAGE_SYSTEM_PROMPT = """You are a technical-support triage assistant.
 
@@ -83,8 +83,6 @@ Do NOT rely only on:
 - product name overlap.
 
 Use the content of the retrieved KB chunk as the evidence.
-
-STEP 2 — MATERIAL EQUIVALENCE.
 
 STEP 2 — MATERIAL EQUIVALENCE.
 
