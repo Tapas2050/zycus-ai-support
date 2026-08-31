@@ -27,61 +27,92 @@ The crucial design constraint is **strict validation**: the app rejects invalid 
 
 ---
 
-## 🔄 Actual Code Flow
+## 🏗️ System Architecture
 
-This is the execution path in the repo:
+Two entrypoints (`ui.py`, `run.py`) share one FastAPI app — the UI never bypasses the API, so both paths hit the same validated contract.
 
 ```text
-data/accounts.json + data/tickets.json
-        │
-        ├── DataRepository
-        │      - loads accounts and tickets
-        │      - resolves account lookup by account_id
-        │      - applies company-based fallback for ticket/account matching
-        │      - exposes get_tickets_for_account(account_id, days=90)
-        │
-        ├── KBRetriever
-        │      - loads knowledge-base markdown files
-        │      - vectorizes with TF-IDF
-        │      - retrieves top chunks for a ticket query
-        │      - formats retrieved context for LLM use
-        │
-        ├── TriageAgent
-        │      - calls KBRetriever.retrieve(...)
-        │      - builds user prompt with only retrieved KB sources
-        │      - calls LLMClient.generate_json(..., response_model=TriageResult)
-        │      - enforces category / urgency / responder-team constraints
-        │      - validates KB source_file + heading against retrieved chunks
-        │      - defends against false-positive generic KB citations
-        │      - caches result only after all guardrails pass
-        │
-        ├── HealthAgent
-        │      - resolves account via DataRepository.get_account(account_id)
-        │      - calls repo.get_tickets_for_account(account_id, days=90)
-        │      - builds account + recent-ticket prompt
-        │      - calls LLMClient.generate_json(..., response_model=AccountHealthResult)
-        │      - enforces account_id match and verbatim evidence-substring checks
-        │      - caches result only after all guardrails pass
-        │
-        ├── FastAPI app in src/app/api.py
-        │      - /health
-        │      - /triage
-        │      - /accounts
-        │      - /accounts/{account_id}/health
-        │      - /accounts/{account_id}/tickets
-        │
-        ├── Gradio UI in ui.py (Real-time Streaming Engine)
-        │      - builds a TestClient around the FastAPI app
-        │      - executes agent calls asynchronously in daemon worker threads
-        │      - streams live status cards, elapsed time, and retry/patience notices
-        │      - cycles non-repeating fun facts & industry insights every 15s
-        │      - renders validated markdown + formatted raw JSON results
-        │
-        └── Evaluation harness
-               - tests/ unit tests
-               - src/app/evaluation/runner.py
-               - writes eval_report.json
+┌──────────────────────┐        ┌──────────────────────────────────┐
+│   Gradio UI (ui.py)   │        │   Any HTTP client / Swagger UI    │
+│  daemon worker threads│        │        (run.py → Uvicorn)         │
+│  status/heartbeat loop│        └────────────────┬───────────────────┘
+└──────────┬────────────┘                         │
+           │  TestClient(fastapi_app)              │  real HTTP
+           │  (in-process, same code path)         │
+           └───────────────────┬────────────────────┘
+                                 ▼
+                  ┌───────────────────────────┐
+                  │   FastAPI app (api.py)     │
+                  │ ── middleware ──           │
+                  │  1. X-API-Key check        │  skipped only for /health
+                  │     (API_AUTH_TOKEN)       │
+                  │  2. per-host rate limiter  │  in-memory sliding 60s window
+                  │     (API_RATE_LIMIT/min)   │
+                  └──────────────┬──────────────┘
+                                 ▼
+        ┌────────────────────────────────────────────┐
+        │  Routes: /triage · /accounts/{id}/health ·  │
+        │  /accounts · /accounts/{id}/tickets · /health│
+        └───────────────┬──────────────┬───────────────┘
+                         ▼              ▼
+              ┌────────────────┐ ┌────────────────┐
+              │  TriageAgent    │ │  HealthAgent    │
+              └───────┬────────┘ └───────┬────────┘
+                      │                  │
+         ┌────────────┘                  └────────────┐
+         ▼                                             ▼
+┌─────────────────┐                          ┌──────────────────────┐
+│  KBRetriever     │                          │  DataRepository       │
+│  TF-IDF over     │                          │  accounts.json +      │
+│  knowledge-base/ │                          │  tickets.json, with   │
+│  (deterministic) │                          │  account_id → company │
+└────────┬─────────┘                          │  fallback join        │
+         │                                    └───────────┬───────────┘
+         └───────────────────┬────────────────────────────┘
+                              ▼
+                 ┌─────────────────────────┐
+                 │   Guardrail checks       │  before any LLM call is
+                 │   (in-agent, pre-prompt) │  trusted — see below
+                 └────────────┬─────────────┘
+                              ▼
+                 ┌─────────────────────────┐
+                 │      LLMClient           │
+                 │  1. cache lookup (hit?)──┼──▶ return cached JSON
+                 │  2. normalize JSON schema│
+                 │  3. call OpenRouter      │
+                 │     (bounded retry loop, │
+                 │      3 attempts, 1s/2s   │
+                 │      backoff, timeout)   │
+                 └────────────┬─────────────┘
+                              ▼
+                 ┌─────────────────────────┐
+                 │  Post-response guardrails│
+                 │  (agent-side validation) │
+                 └────────────┬─────────────┘
+                     pass │        │ fail
+                          ▼        ▼
+              cache_result()   reject / re-raise
+              (SHA-256 keyed,  (nothing unvalidated
+               .cache/llm/)     is ever cached)
 ```
+
+### Guardrail chain (why nothing ungrounded reaches the user)
+
+```text
+TriageAgent.triage()                    HealthAgent.summarise()
+  │                                        │
+  ├─ category ∈ allowed set?               ├─ account_id resolves via DataRepository?
+  ├─ responder_team ∈ allowed set?         ├─ get_tickets_for_account(id, days=90)
+  ├─ KB source_file + heading actually     ├─ every ticket_risk.evidence_quote is an
+  │  present in the retrieved chunk set?   │  exact substring of the source ticket body?
+  ├─ KB match's product/operation matches  ├─ account_id in the LLM's own output matches
+  │  the ticket's context (no generic-hit  │  the requested account_id?
+  │  false positive)?                      │
+  ▼                                        ▼
+only then → LLMClient.cache_result()  only then → LLMClient.cache_result()
+```
+
+**Design rationale (from `docs/ARCHITECTURE.md`):** no database — the take-home ships small JSON datasets, so an in-process repository is sufficient; retrieval is deterministic TF-IDF rather than a hosted vector DB, chosen for reproducibility over a four-hour build; RAG is kept separate from LLM orchestration — the model only ever sees explicitly retrieved context, it never searches the filesystem itself.
 
 ---
 
